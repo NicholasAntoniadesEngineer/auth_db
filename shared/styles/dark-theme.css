@@ -1,0 +1,88 @@
+/* ============================================================================
+   Secure Messenger — Dark Theme (always-on)
+   ============================================================================
+   Overrides the design tokens defined in main-compiled.css (@theme) with a
+   modern slate/charcoal dark palette. Load this AFTER main-compiled.css.
+   Both the component CSS (var(--color-*)) and Tailwind utilities (which
+   reference the same @theme CSS variables) pick these up, so the whole UI
+   flips with no recompile. Scoped to this app only (messaging_app repo).
+   ============================================================================ */
+
+:root {
+    color-scheme: dark;
+
+    /* Surfaces — layered charcoal/slate ramp (page is darkest, card lightest) */
+    --color-bg-page: #0d1017;
+    --color-bg-elevated: #141926;
+    --color-bg-surface: #1b2130;
+    --color-bg-card: #222a3c;
+    --color-bg-input: #283146;
+    --color-bg-white: #222a3c;            /* remap "white" surfaces to dark card */
+    --color-bg-overlay: rgba(0, 0, 0, 0.62);
+    --color-bg-glass: rgba(18, 22, 34, 0.92);
+
+    /* Text */
+    --color-text: #e7eaf2;
+    --color-text-primary: #e7eaf2;        /* referenced by some inline styles */
+    --color-text-secondary: #aab3c7;
+    --color-text-muted: #7f8aa3;
+    --color-text-inverse: #0d1017;        /* dark text on light accent buttons */
+    --color-text-success: #5fd0a0;
+    --color-text-danger: #f0938f;
+
+    /* Borders */
+    --color-border: #2c3548;
+    --color-border-light: #232c3e;
+    --color-border-dark: #3a4660;
+    --color-border-focus: var(--color-action);
+
+    /* Accent (brand slate-blue, brightened for contrast on dark) */
+    --color-action: #8fb3c7;
+    --color-action-hover: #a9c7d8;
+    --color-action-light: #6f93a6;
+    --color-action-subtle: rgba(143, 179, 199, 0.16);
+    --color-primary: #8fb3c7;
+    --color-primary-hover: #a9c7d8;
+
+    /* Status colours (tuned for dark backgrounds) */
+    --color-success: #3ea57d;
+    --color-success-hover: #4cba90;
+    --color-success-light: rgba(62, 165, 125, 0.16);
+    --color-success-subtle: rgba(62, 165, 125, 0.10);
+    --color-danger: #d96a6a;
+    --color-danger-hover: #e58080;
+    --color-danger-light: rgba(217, 106, 106, 0.16);
+    --color-danger-subtle: rgba(217, 106, 106, 0.10);
+    --color-warning: #d8a657;
+    --color-warning-hover: #e6b96f;
+    --color-warning-light: rgba(216, 166, 87, 0.16);
+
+    /* Slate utility scale (text-slate-* used in the auth/subscription pages).
+       Remapped so "darker" slate utilities read as lighter text on dark. */
+    --color-slate-500: #9aa3b8;
+    --color-slate-600: #aab3c7;
+    --color-slate-800: #e7eaf2;
+}
+
+/* Ensure the page itself is dark even where a base style set a light bg. */
+html, body {
+    background-color: var(--color-bg-page);
+    color: var(--color-text);
+}
+
+/* Dark, slim scrollbars to match. */
+* {
+    scrollbar-color: #3a4660 transparent;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #3a4660; border-radius: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Inputs/selects/textareas: make sure placeholders + native UI read on dark. */
+input, textarea, select {
+    color: var(--color-text);
+    background-color: var(--color-bg-input);
+}
+input::placeholder, textarea::placeholder {
+    color: var(--color-text-muted);
+}
