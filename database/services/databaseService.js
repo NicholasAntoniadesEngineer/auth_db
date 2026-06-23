@@ -2941,69 +2941,98 @@ const DatabaseService = {
     // (unsealDEK) to decrypt the shared rows. See BUDGET_E2E_DESIGN.md §2.5 / §7.
 
     /**
-     * Resolve a user's current identity X25519 PUBLIC key (base64) from identity_keys.
-     * Uses HistoricalKeysService.getCurrentKey when available (the house accessor,
-     * identity_keys has RLS select_all), else reads the identity_keys row directly via
-     * querySelect (same RLS). Returns null when the user has not published an identity
-     * yet — the caller then leaves the share UN-sealed (the recipient cannot decrypt
-     * until they have an identity and the owner re-shares).
+     * Resolve a peer's identity X25519 PUBLIC key (base64) through the TOFU chokepoint.
+     *
+     * SEC-H4 (fix 1): this now goes through KeyManagementService._getPinnedPeerKey,
+     * the SAME trust-on-first-use pin both the X3DH and ECDH sites use. That means:
+     *   - first contact   -> pin the published key and return it (TOFU),
+     *   - unchanged key   -> return it,
+     *   - CHANGED key     -> THROW PeerIdentityChangedError (fail closed).
+     * Previously this read identity_keys directly (RLS USING(true)) / via
+     * HistoricalKeysService.getCurrentKey, so a curious server that substituted the
+     * recipient's published identity_keys row could redirect the budget-DEK seal to a
+     * server-held key and recover the DEK. Routing through the pin makes a key
+     * SUBSTITUTION on the share path fail closed instead of sealing to it.
+     *
+     * We FAIL CLOSED on a changed pin: PeerIdentityChangedError propagates so the
+     * caller (createDataShare seal) refuses to seal to an unpinned/changed key rather
+     * than silently sealing to whatever the server published. A genuine "no identity
+     * published yet" still returns null (leave the share un-sealed).
      * @private
      * @param {string} userId
-     * @returns {Promise<string|null>} base64 public key or null
+     * @returns {Promise<string|null>} base64 public key or null (no published identity)
+     * @throws {PeerIdentityChangedError} when the pinned identity key has changed
      */
     async _getRecipientIdentityPublicKey(userId) {
         if (!userId) return null;
-        const HKS = (typeof window !== 'undefined' && window.HistoricalKeysService)
-            ? window.HistoricalKeysService
-            : (typeof HistoricalKeysService !== 'undefined' ? HistoricalKeysService
-                : (typeof globalThis !== 'undefined' ? globalThis.HistoricalKeysService : undefined));
-        if (HKS && typeof HKS.getCurrentKey === 'function') {
-            try {
-                const pub = await HKS.getCurrentKey(userId);
-                if (pub) return pub;
-            } catch (e) {
-                console.warn('[DatabaseService] _getRecipientIdentityPublicKey: getCurrentKey failed, falling back to direct read:', e && e.message);
-            }
+        const KMS = (typeof window !== 'undefined' && window.KeyManagementService)
+            ? window.KeyManagementService
+            : (typeof KeyManagementService !== 'undefined' ? KeyManagementService
+                : (typeof globalThis !== 'undefined' ? globalThis.KeyManagementService : undefined));
+        if (KMS && typeof KMS._getPinnedPeerKey === 'function') {
+            // Let PeerIdentityChangedError propagate — the seal MUST fail closed on a
+            // changed/substituted recipient key (do NOT fall back to a raw read).
+            const pinned = await KMS._getPinnedPeerKey(userId);
+            return pinned || null; // null = peer has no published identity yet
         }
-        // Fallback: direct identity_keys read (RLS identity_keys_select_all = USING(true)).
-        // 'identity_keys' is the canonical table name (HistoricalKeysService defaults to
-        // it too); hard-coded here since _getTableName has no 'identityKeys' mapping.
-        const { data, error } = await this.querySelect('identity_keys', {
-            select: 'user_id,public_key',
-            filter: { user_id: userId },
-            limit: 1,
-        });
-        if (error) {
-            console.warn('[DatabaseService] _getRecipientIdentityPublicKey: identity_keys read failed:', error.message || error.code);
-            return null;
-        }
-        return (Array.isArray(data) && data[0] && data[0].public_key) ? data[0].public_key : null;
+        // KMS unavailable (e.g. budget-only context with no messaging stack). There is
+        // no TOFU pin to enforce here, so FAIL CLOSED rather than seal to an unpinned
+        // raw read: refuse to seal (the recipient simply cannot decrypt until the
+        // messaging/identity stack is present to pin the key). This is intentional —
+        // sealing to an unauthenticated key is exactly the H-4 hole.
+        console.warn('[DatabaseService] _getRecipientIdentityPublicKey: KeyManagementService TOFU chokepoint unavailable — refusing to seal to an unpinned key (share left un-sealed)');
+        return null;
     },
 
     /**
      * Seal the OWNER's budget DEK to a recipient's identity pubkey and return the
-     * three base64 data_shares columns, or null when sealing is not possible (no
-     * recipient identity yet, or no owner DEK). Never throws — sealing is best-effort
-     * additive metadata on the share; a failure leaves the share un-sealed (the
-     * recipient just cannot decrypt yet) rather than breaking share creation.
+     * data_shares seal columns, or null when sealing is not possible (no recipient
+     * identity yet, or no owner DEK). Never throws — sealing is best-effort additive
+     * metadata on the share; a failure leaves the share un-sealed (the recipient just
+     * cannot decrypt yet) rather than breaking share creation.
+     *
+     * SEC-H4: the seal is now AUTHENTICATED + context-bound. We pass the OWNER's static
+     * identity secret (static-static DH leg authenticates the owner), the OWNER's IK
+     * pub, the dek_version, and the (owner_id, recipient_id, share_id) context so the
+     * seal cannot be redirected, forged, or lifted onto another row. The recipient key
+     * is resolved through the TOFU pin (_getRecipientIdentityPublicKey), so a
+     * substituted recipient key fails closed.
      * @private
      * @param {string} ownerUserId
      * @param {string} recipientUserId
-     * @returns {Promise<{wrapped_dek:string, wrap_nonce:string, wrap_eph_pub:string}|null>}
+     * @param {number|string} shareId - the data_shares row id (bound into the seal)
+     * @returns {Promise<{wrapped_dek:string, wrap_nonce:string, wrap_eph_pub:string,
+     *           wrap_owner_ik:string, wrap_alg:string, dek_version:(number|string)}|null>}
      */
-    async _sealShareDekForRecipient(ownerUserId, recipientUserId) {
+    async _sealShareDekForRecipient(ownerUserId, recipientUserId, shareId) {
         try {
             // Ensure the OWNER's DEK is loaded (createDataShare may run before any
             // budget read/save bootstrapped it this session).
             await this._ensureBudgetDekForUser(ownerUserId);
-            const dek = this._budgetKeyService().getBudgetDEK(ownerUserId);
+            const bks = this._budgetKeyService();
+            const dek = bks.getBudgetDEK(ownerUserId);
+
+            // OWNER static identity (for the authenticating static-static DH leg).
+            const ownerSecret = await bks._getIdentitySecret(ownerUserId);
+            const dekVersion = (bks.DEK_VERSION !== undefined && bks.DEK_VERSION !== null)
+                ? bks.DEK_VERSION : 1;
 
             const recipientPub = await this._getRecipientIdentityPublicKey(recipientUserId);
             if (!recipientPub) {
-                console.warn('[DatabaseService] _sealShareDekForRecipient: recipient has no published identity key — leaving share un-sealed (recipient cannot decrypt until re-shared)');
+                console.warn('[DatabaseService] _sealShareDekForRecipient: recipient has no published/pinned identity key — leaving share un-sealed (recipient cannot decrypt until re-shared)');
                 return null;
             }
-            return this._budgetCryptoService().sealDEKToRecipient(dek, recipientPub);
+            if (shareId === undefined || shareId === null) {
+                console.warn('[DatabaseService] _sealShareDekForRecipient: missing shareId — cannot context-bind the seal, leaving un-sealed');
+                return null;
+            }
+            return this._budgetCryptoService().sealDEKToRecipient(dek, recipientPub, {
+                ownerSecretKey: ownerSecret,
+                ownerId: ownerUserId,
+                recipientId: recipientUserId,
+                dekVersion: dekVersion,
+                shareId: shareId,
+            });
         } catch (e) {
             console.warn('[DatabaseService] _sealShareDekForRecipient: could not seal DEK — leaving share un-sealed:', e && e.message);
             return null;
@@ -3014,10 +3043,19 @@ const DatabaseService = {
      * Unseal the OWNER's budget DEK from a share row using THIS user's identity
      * secret, so the recipient can decrypt the owner's shared rows. Returns the
      * 32-byte DEK, or null when the share has no sealed DEK (legacy/un-sealed share)
-     * or it cannot be unsealed (not the intended recipient / tamper). Never throws —
-     * a bad/absent seal makes the shared row fall through to the H11 per-row skip.
+     * or it cannot be unsealed (not the intended recipient / tamper / context
+     * mismatch / unpinned-or-changed owner key). Never throws — a bad/absent seal makes
+     * the shared row fall through to the H11 per-row skip.
+     *
+     * SEC-H4: verifies the AUTHENTICATED + context-bound seal. We resolve the OWNER's
+     * PINNED identity key through the TOFU chokepoint (_getRecipientIdentityPublicKey
+     * routes through _getPinnedPeerKey) and pass it as expectedOwnerPublicKey, plus the
+     * (owner_id, recipient_id, dek_version, share_id) context, so unsealDEK fails closed
+     * unless the seal was made by the genuine, pinned owner FOR this recipient, this
+     * dek_version, and this exact share row.
      * @private
-     * @param {Object} share - a data_shares row (carries wrapped_dek/wrap_nonce/wrap_eph_pub)
+     * @param {Object} share - a data_shares row (carries wrapped_dek/wrap_nonce/
+     *        wrap_eph_pub/wrap_owner_ik/dek_version, owner_user_id, id)
      * @returns {Promise<Uint8Array|null>}
      */
     async _unsealOwnerDekFromShare(share) {
@@ -3034,15 +3072,73 @@ const DatabaseService = {
             if (!recipientUserId) return null;
             // The recipient's OWN identity secret (NOT their budget DEK).
             const identityKeys = await this._budgetKeyService()._getIdentitySecret(recipientUserId);
+
+            // SEC-H4: resolve the OWNER's PINNED identity key (fail-closed via the TOFU
+            // chokepoint) — this is the sender static key the seal MUST be bound to.
+            const ownerPinnedPub = await this._getRecipientIdentityPublicKey(share.owner_user_id);
+            if (!ownerPinnedPub) {
+                console.warn(`[DatabaseService] _unsealOwnerDekFromShare: no pinned owner identity for share ${share && share.id} — fail closed`);
+                return null;
+            }
+
             const ownerDek = this._budgetCryptoService().unsealDEK(
-                { wrapped_dek: share.wrapped_dek, wrap_nonce: share.wrap_nonce, wrap_eph_pub: share.wrap_eph_pub },
-                identityKeys
+                {
+                    wrapped_dek: share.wrapped_dek,
+                    wrap_nonce: share.wrap_nonce,
+                    wrap_eph_pub: share.wrap_eph_pub,
+                    wrap_owner_ik: share.wrap_owner_ik,
+                    wrap_alg: share.wrap_alg,
+                    dek_version: share.dek_version,
+                },
+                identityKeys,
+                {
+                    expectedOwnerPublicKey: ownerPinnedPub,
+                    ownerId: share.owner_user_id,
+                    recipientId: recipientUserId,
+                    dekVersion: share.dek_version,
+                    shareId: share.id,
+                }
             );
             this._sharedDekCache.set(share.id, ownerDek);
             return ownerDek;
         } catch (e) {
             console.warn(`[DatabaseService] _unsealOwnerDekFromShare: could not unseal owner DEK for share ${share && share.id} — shared rows will skip:`, e && e.message);
             return null;
+        }
+    },
+
+    /**
+     * SEC-C1: mutate a share's grant flags (can_edit / share_all_data) through the
+     * owner-only SECURITY DEFINER update_share_grants() RPC. The direct client UPDATE
+     * grant deliberately EXCLUDES these columns (a recipient PATCH of them was the
+     * C-1 escalation), so the only sanctioned path to change them is this RPC, which
+     * re-asserts auth.uid() = owner_user_id server-side. Best-effort: a failure does
+     * NOT fail share create/update (the row still exists; only the flag may lag), but
+     * it is logged. can_edit defaults to its current value when null is passed.
+     * @private
+     * @param {number|string} shareId
+     * @param {boolean} shareAllData
+     * @param {boolean|null} [canEdit=null] - null leaves can_edit unchanged
+     * @returns {Promise<boolean>} true if the RPC reported success
+     */
+    async _applyShareGrants(shareId, shareAllData, canEdit = null) {
+        try {
+            if (shareId === undefined || shareId === null) return false;
+            const res = await this.queryRpc('update_share_grants', {
+                p_share_id: shareId,
+                p_can_edit: (canEdit === null || canEdit === undefined) ? null : !!canEdit,
+                p_share_all_data: !!shareAllData,
+            });
+            // queryRpc may surface either {data, error} or the raw JSONB payload.
+            const payload = (res && res.data !== undefined) ? res.data : res;
+            const ok = !!(payload && payload.success);
+            if (!ok) {
+                console.warn('[DatabaseService] _applyShareGrants: update_share_grants RPC did not succeed:', (payload && payload.error) || (res && res.error && res.error.message) || 'unknown');
+            }
+            return ok;
+        } catch (e) {
+            console.warn('[DatabaseService] _applyShareGrants: update_share_grants RPC threw (share grant flag may not be set):', e && e.message);
+            return false;
         }
     },
 
@@ -3816,24 +3912,25 @@ const DatabaseService = {
                     }
                 }
                 
+                // SEC-C1: share_all_data is withheld from the direct UPDATE column-grant
+                // (it is a grant flag); it is set via the owner-only DEFINER RPC below.
                 const updateData = {
                     access_level: accessLevel,
                     shared_months: JSON.stringify(sharedMonths),
                     shared_pots: sharedPots,
                     shared_settings: sharedSettings,
-                    share_all_data: shareAllData,
                     status: shareStatus,
                     updated_at: new Date().toISOString()
                 };
-                
+
                 // Include conversation_id if available
                 if (conversationId !== null) {
                     updateData.conversation_id = conversationId;
                 }
-                
+
                 console.log('[DatabaseService] Updating existing share with data:', updateData);
                 const updateResult = await this.queryUpdate(tableName, shareId, updateData);
-                
+
                 if (updateResult.error) {
                     console.error('[DatabaseService] Error updating data share:', updateResult.error);
                     return {
@@ -3842,8 +3939,11 @@ const DatabaseService = {
                         error: updateResult.error.message || 'Failed to update share'
                     };
                 }
-                
+
                 share = updateResult.data && updateResult.data.length > 0 ? updateResult.data[0] : existingShare;
+                // SEC-C1: set the grant flag via the owner-only DEFINER RPC.
+                await this._applyShareGrants(shareId, shareAllData);
+                if (share) share.share_all_data = shareAllData;
                 console.log('[DatabaseService] Share updated successfully');
             } else {
                 // No existing share, create new one
@@ -3894,21 +3994,22 @@ const DatabaseService = {
                                 }
                             }
                             
+                            // SEC-C1: share_all_data set via the owner-only DEFINER RPC,
+                            // not the direct UPDATE (it is withheld from the column-grant).
                             const updateData = {
                                 access_level: accessLevel,
                                 shared_months: JSON.stringify(sharedMonths),
                                 shared_pots: sharedPots,
                                 shared_settings: sharedSettings,
-                                share_all_data: shareAllData,
                                 status: shareStatus,
                                 updated_at: new Date().toISOString()
                             };
-                            
+
                             // Include conversation_id if available
                             if (conversationId !== null) {
                                 updateData.conversation_id = conversationId;
                             }
-                            
+
                             const updateResult = await this.queryUpdate(tableName, existingShare.id, updateData);
                             if (updateResult.error) {
                                 return {
@@ -3918,6 +4019,9 @@ const DatabaseService = {
                                 };
                             }
                             share = updateResult.data && updateResult.data.length > 0 ? updateResult.data[0] : existingShare;
+                            // SEC-C1: set the grant flag via the owner-only DEFINER RPC.
+                            await this._applyShareGrants(existingShare.id, shareAllData);
+                            if (share) share.share_all_data = shareAllData;
                             console.log('[DatabaseService] Share updated after duplicate key error');
                         } else {
                             return {
@@ -3953,12 +4057,16 @@ const DatabaseService = {
             // wrapped DEK current and is harmless (same DEK, new ephemeral).
             if (share && share.id) {
                 try {
-                    const sealed = await this._sealShareDekForRecipient(currentUserId, userResult.userId);
+                    // SEC-H4: authenticated, context-bound seal — pass the share id so the
+                    // seal is bound to (owner, recipient, dek_version, share_id).
+                    const sealed = await this._sealShareDekForRecipient(currentUserId, userResult.userId, share.id);
                     if (sealed) {
                         const sealUpdate = await this.queryUpdate(tableName, share.id, {
                             wrapped_dek: sealed.wrapped_dek,
                             wrap_nonce: sealed.wrap_nonce,
                             wrap_eph_pub: sealed.wrap_eph_pub,
+                            wrap_owner_ik: sealed.wrap_owner_ik,
+                            dek_version: sealed.dek_version,
                         });
                         if (sealUpdate.error) {
                             console.warn('[DatabaseService] S7: failed to persist sealed DEK on share (recipient cannot decrypt until re-shared):', sealUpdate.error.message || sealUpdate.error.code);
@@ -3967,7 +4075,9 @@ const DatabaseService = {
                             share.wrapped_dek = sealed.wrapped_dek;
                             share.wrap_nonce = sealed.wrap_nonce;
                             share.wrap_eph_pub = sealed.wrap_eph_pub;
-                            console.log('[DatabaseService] S7: sealed owner DEK to recipient identity on share', share.id);
+                            share.wrap_owner_ik = sealed.wrap_owner_ik;
+                            share.dek_version = sealed.dek_version;
+                            console.log('[DatabaseService] S7/SEC-H4: sealed (authenticated) owner DEK to recipient identity on share', share.id);
                         }
                     }
                 } catch (sealErr) {
@@ -4175,13 +4285,16 @@ const DatabaseService = {
             
             const tableName = this._getTableName('dataShares');
             console.log('[DatabaseService] Table name:', tableName);
-            
+
+            // SEC-C1: share_all_data (a grant flag) is NOT in the client UPDATE
+            // column-grant — a direct PATCH of it is rejected (42501). Owner mutation of
+            // the grant flags goes through the SECURITY DEFINER update_share_grants() RPC
+            // (re-asserts auth.uid() = owner). Keep it OUT of this direct UPDATE payload.
             const updateData = {
                 access_level: accessLevel,
                 shared_months: JSON.stringify(sharedMonths),
                 shared_pots: sharedPots,
                 shared_settings: sharedSettings,
-                share_all_data: shareAllData,
                 updated_at: new Date().toISOString()
             };
             console.log('[DatabaseService] Update data object:', updateData);
@@ -4224,11 +4337,15 @@ const DatabaseService = {
             const share = result.data && result.data.length > 0 ? result.data[0] : null;
             console.log('[DatabaseService] Extracted share from result:', share);
             console.log('[DatabaseService] Share ID:', share ? share.id : 'no share');
-            
+
+            // SEC-C1: mutate the grant flag (share_all_data) via the owner-only DEFINER
+            // RPC, since it is withheld from the direct UPDATE column-grant.
+            await this._applyShareGrants(shareId, shareAllData);
+
             console.log('[DatabaseService] ✅ updateDataShare SUCCESS');
             return {
                 success: true,
-                share: share,
+                share: share ? { ...share, share_all_data: shareAllData } : share,
                 error: null
             };
         } catch (error) {
