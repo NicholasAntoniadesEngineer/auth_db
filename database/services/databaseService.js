@@ -1143,6 +1143,14 @@ const DatabaseService = {
         this.settingsCache = null;
         this.settingsCacheUserId = null;
         this.settingsCachePromise = null;
+        // S7: drop any unsealed owner-DEKs cached for shared reads, so a re-login as a
+        // different user (or a revoked share) cannot reuse a stale owner DEK.
+        if (this._sharedDekCache) {
+            for (const dek of this._sharedDekCache.values()) {
+                if (dek instanceof Uint8Array) dek.fill(0); // best-effort zeroize
+            }
+            this._sharedDekCache.clear();
+        }
         try {
             localStorage.removeItem(this.CACHE_STORAGE_KEY);
             localStorage.removeItem(this.CACHE_TIMESTAMP_KEY);
@@ -1849,7 +1857,15 @@ const DatabaseService = {
                             } catch (emailError) {
                                 console.warn('[DatabaseService] Error fetching owner email for share:', emailError);
                             }
-                            
+
+                            // S7: unseal the OWNER's budget DEK from this share ONCE,
+                            // using THIS user's identity secret. The owner's rows are
+                            // ciphertext under the owner's DEK; we need that DEK (not
+                            // ours) to decrypt them. null => legacy/un-sealed share or
+                            // not the intended recipient — the per-row decrypt then
+                            // throws and the H11 try/catch skips just that row.
+                            const ownerDek = await this._unsealOwnerDekFromShare(share);
+
                             // If share_all_data is true, fetch all months from the owner
                             if (share.share_all_data) {
                                 console.log(`[DatabaseService] Share ${share.id} has share_all_data=true, fetching all months from owner ${share.owner_user_id}`);
@@ -1864,15 +1880,16 @@ const DatabaseService = {
                                     for (const monthRecord of ownerMonthsResult.data) {
                                         const monthKey = this.generateMonthKey(monthRecord.year, monthRecord.month);
                                         if (!monthsObject[monthKey]) {
-                                            // H11 resilience: an owner's row is encrypted with the
-                                            // OWNER's DEK, which a recipient cannot unwrap, so the
-                                            // transform may throw BudgetDecryptError. Skip the one
-                                            // bad shared month instead of aborting the whole loop
-                                            // (the user's own months still load). Full cross-user
-                                            // sharing crypto is a later step (S7).
+                                            // S7: decrypt the owner's ciphertext row with the
+                                            // OWNER's DEK unsealed from the share (ownerDek). H11
+                                            // per-row resilience stays: a genuinely bad/un-sealed
+                                            // share (ownerDek null, or tamper) throws inside the
+                                            // transform and we skip just that row rather than
+                                            // aborting the whole loop (the user's own months still
+                                            // load).
                                             let transformedMonth;
                                             try {
-                                                transformedMonth = this.transformMonthFromDatabase(monthRecord);
+                                                transformedMonth = this.transformMonthFromDatabase(monthRecord, ownerDek);
                                             } catch (decryptError) {
                                                 console.warn(`[DatabaseService] Skipping undecryptable shared month (all data) ${monthKey} from user ${share.owner_user_id}:`, decryptError.message);
                                                 continue;
@@ -1924,12 +1941,12 @@ const DatabaseService = {
                                                 
                                                 if (sharedMonthResult.data && sharedMonthResult.data.length > 0) {
                                                     const monthRecord = sharedMonthResult.data[0];
-                                                    // H11 resilience: skip an undecryptable shared month
-                                                    // (owner's DEK, not the recipient's) rather than
-                                                    // aborting the whole shared-months loop.
+                                                    // S7: decrypt with the OWNER's DEK (ownerDek)
+                                                    // unsealed from the share. H11 per-row skip stays
+                                                    // for a genuinely bad/un-sealed share.
                                                     let transformedMonth;
                                                     try {
-                                                        transformedMonth = this.transformMonthFromDatabase(monthRecord);
+                                                        transformedMonth = this.transformMonthFromDatabase(monthRecord, ownerDek);
                                                     } catch (decryptError) {
                                                         console.warn(`[DatabaseService] Skipping undecryptable shared month ${monthKey} from user ${share.owner_user_id}:`, decryptError.message);
                                                         continue;
@@ -1962,12 +1979,12 @@ const DatabaseService = {
                                         
                                         if (sharedMonthResult.data && sharedMonthResult.data.length > 0) {
                                             const monthRecord = sharedMonthResult.data[0];
-                                            // H11 resilience: skip an undecryptable shared month
-                                            // (owner's DEK, not the recipient's) rather than
-                                            // aborting the whole shared-months loop.
+                                            // S7: decrypt with the OWNER's DEK (ownerDek) unsealed
+                                            // from the share. H11 per-row skip stays for a genuinely
+                                            // bad/un-sealed share.
                                             let transformedMonth;
                                             try {
-                                                transformedMonth = this.transformMonthFromDatabase(monthRecord);
+                                                transformedMonth = this.transformMonthFromDatabase(monthRecord, ownerDek);
                                             } catch (decryptError) {
                                                 console.warn(`[DatabaseService] Skipping undecryptable shared month ${monthKey} from user ${share.owner_user_id}:`, decryptError.message);
                                                 continue;
@@ -2109,7 +2126,17 @@ const DatabaseService = {
                                     
                                     if (sharedMonthResult.data && sharedMonthResult.data.length > 0) {
                                         data = sharedMonthResult.data[0];
-                                        const transformedMonth = this.transformMonthFromDatabase(data);
+                                        // S7: decrypt with the OWNER's DEK unsealed from the share.
+                                        // Per-row try/catch (H11 discipline): an un-sealed / bad
+                                        // share skips rather than throwing out of getMonth.
+                                        const ownerDek = await this._unsealOwnerDekFromShare(share);
+                                        let transformedMonth;
+                                        try {
+                                            transformedMonth = this.transformMonthFromDatabase(data, ownerDek);
+                                        } catch (decryptError) {
+                                            console.warn(`[DatabaseService] Skipping undecryptable shared month ${monthKey} from user ${share.owner_user_id}:`, decryptError.message);
+                                            continue;
+                                        }
                                         transformedMonth.isShared = true;
                                         transformedMonth.sharedOwnerId = share.owner_user_id;
                                         transformedMonth.sharedAccessLevel = share.access_level;
@@ -2150,7 +2177,15 @@ const DatabaseService = {
                                     
                                     if (sharedMonthResult.data && sharedMonthResult.data.length > 0) {
                                         data = sharedMonthResult.data[0];
-                                        const transformedMonth = this.transformMonthFromDatabase(data);
+                                        // S7: decrypt with the OWNER's DEK unsealed from the share.
+                                        const ownerDek = await this._unsealOwnerDekFromShare(share);
+                                        let transformedMonth;
+                                        try {
+                                            transformedMonth = this.transformMonthFromDatabase(data, ownerDek);
+                                        } catch (decryptError) {
+                                            console.warn(`[DatabaseService] Skipping undecryptable shared month ${monthKey} from user ${share.owner_user_id}:`, decryptError.message);
+                                            continue;
+                                        }
                                         transformedMonth.isShared = true;
                                         transformedMonth.sharedOwnerId = share.owner_user_id;
                                         transformedMonth.sharedAccessLevel = share.access_level;
@@ -2530,17 +2565,20 @@ const DatabaseService = {
                                     filter: { user_id: share.owner_user_id },
                                     order: [{ column: 'created_at', ascending: false }]
                                 });
-                                
+                                // S7: unseal the OWNER's DEK from this share ONCE (await
+                                // BEFORE the sync forEach below). null => legacy/un-sealed
+                                // or not the recipient — each pot then throws and skips.
+                                const ownerDek = await this._unsealOwnerDekFromShare(share);
+
                                 if (sharedPotsResult.data && Array.isArray(sharedPotsResult.data)) {
                                     sharedPotsResult.data.forEach(pot => {
-                                        // H11 resilience: an owner's pot is encrypted with the
-                                        // OWNER's DEK, which the recipient cannot unwrap, so the
-                                        // transform may throw BudgetDecryptError. Skip the one bad
-                                        // shared pot instead of aborting all shared pots (the
-                                        // user's own pots still load). S7 covers cross-user crypto.
+                                        // S7: decrypt the owner's ciphertext pot with the OWNER's
+                                        // DEK (ownerDek). H11 per-row skip stays: a genuinely
+                                        // bad/un-sealed share throws inside the transform and we
+                                        // skip just that pot rather than aborting all shared pots.
                                         let transformedPot;
                                         try {
-                                            transformedPot = this.transformPotFromDatabase(pot);
+                                            transformedPot = this.transformPotFromDatabase(pot, ownerDek);
                                         } catch (decryptError) {
                                             console.warn(`[DatabaseService] Skipping undecryptable shared pot ${pot.id} from user ${share.owner_user_id}:`, decryptError.message);
                                             return;
@@ -2894,17 +2932,135 @@ const DatabaseService = {
         await this._budgetKeyService().ensureBudgetDEK(userId);
     },
 
+    // ==================== cross-user sharing — DEK seal/unseal (S7) ====================
+    //
+    // Under E2E (S1-S6) every shared user_months/pots row is ciphertext under the
+    // OWNER's DEK, which a recipient cannot decrypt with their own DEK. S7 SEALS the
+    // owner's DEK to the recipient's identity public key on the data_shares row (nacl
+    // box, BudgetCryptoService.sealDEKToRecipient) and the recipient UNSEALS it
+    // (unsealDEK) to decrypt the shared rows. See BUDGET_E2E_DESIGN.md §2.5 / §7.
+
+    /**
+     * Resolve a user's current identity X25519 PUBLIC key (base64) from identity_keys.
+     * Uses HistoricalKeysService.getCurrentKey when available (the house accessor,
+     * identity_keys has RLS select_all), else reads the identity_keys row directly via
+     * querySelect (same RLS). Returns null when the user has not published an identity
+     * yet — the caller then leaves the share UN-sealed (the recipient cannot decrypt
+     * until they have an identity and the owner re-shares).
+     * @private
+     * @param {string} userId
+     * @returns {Promise<string|null>} base64 public key or null
+     */
+    async _getRecipientIdentityPublicKey(userId) {
+        if (!userId) return null;
+        const HKS = (typeof window !== 'undefined' && window.HistoricalKeysService)
+            ? window.HistoricalKeysService
+            : (typeof HistoricalKeysService !== 'undefined' ? HistoricalKeysService
+                : (typeof globalThis !== 'undefined' ? globalThis.HistoricalKeysService : undefined));
+        if (HKS && typeof HKS.getCurrentKey === 'function') {
+            try {
+                const pub = await HKS.getCurrentKey(userId);
+                if (pub) return pub;
+            } catch (e) {
+                console.warn('[DatabaseService] _getRecipientIdentityPublicKey: getCurrentKey failed, falling back to direct read:', e && e.message);
+            }
+        }
+        // Fallback: direct identity_keys read (RLS identity_keys_select_all = USING(true)).
+        // 'identity_keys' is the canonical table name (HistoricalKeysService defaults to
+        // it too); hard-coded here since _getTableName has no 'identityKeys' mapping.
+        const { data, error } = await this.querySelect('identity_keys', {
+            select: 'user_id,public_key',
+            filter: { user_id: userId },
+            limit: 1,
+        });
+        if (error) {
+            console.warn('[DatabaseService] _getRecipientIdentityPublicKey: identity_keys read failed:', error.message || error.code);
+            return null;
+        }
+        return (Array.isArray(data) && data[0] && data[0].public_key) ? data[0].public_key : null;
+    },
+
+    /**
+     * Seal the OWNER's budget DEK to a recipient's identity pubkey and return the
+     * three base64 data_shares columns, or null when sealing is not possible (no
+     * recipient identity yet, or no owner DEK). Never throws — sealing is best-effort
+     * additive metadata on the share; a failure leaves the share un-sealed (the
+     * recipient just cannot decrypt yet) rather than breaking share creation.
+     * @private
+     * @param {string} ownerUserId
+     * @param {string} recipientUserId
+     * @returns {Promise<{wrapped_dek:string, wrap_nonce:string, wrap_eph_pub:string}|null>}
+     */
+    async _sealShareDekForRecipient(ownerUserId, recipientUserId) {
+        try {
+            // Ensure the OWNER's DEK is loaded (createDataShare may run before any
+            // budget read/save bootstrapped it this session).
+            await this._ensureBudgetDekForUser(ownerUserId);
+            const dek = this._budgetKeyService().getBudgetDEK(ownerUserId);
+
+            const recipientPub = await this._getRecipientIdentityPublicKey(recipientUserId);
+            if (!recipientPub) {
+                console.warn('[DatabaseService] _sealShareDekForRecipient: recipient has no published identity key — leaving share un-sealed (recipient cannot decrypt until re-shared)');
+                return null;
+            }
+            return this._budgetCryptoService().sealDEKToRecipient(dek, recipientPub);
+        } catch (e) {
+            console.warn('[DatabaseService] _sealShareDekForRecipient: could not seal DEK — leaving share un-sealed:', e && e.message);
+            return null;
+        }
+    },
+
+    /**
+     * Unseal the OWNER's budget DEK from a share row using THIS user's identity
+     * secret, so the recipient can decrypt the owner's shared rows. Returns the
+     * 32-byte DEK, or null when the share has no sealed DEK (legacy/un-sealed share)
+     * or it cannot be unsealed (not the intended recipient / tamper). Never throws —
+     * a bad/absent seal makes the shared row fall through to the H11 per-row skip.
+     * @private
+     * @param {Object} share - a data_shares row (carries wrapped_dek/wrap_nonce/wrap_eph_pub)
+     * @returns {Promise<Uint8Array|null>}
+     */
+    async _unsealOwnerDekFromShare(share) {
+        if (!share || !share.wrapped_dek || !share.wrap_nonce || !share.wrap_eph_pub) {
+            return null; // legacy / un-sealed share — no owner DEK available to the recipient
+        }
+        // Per-share cache so a share covering many months unseals once.
+        this._sharedDekCache = this._sharedDekCache || new Map();
+        if (this._sharedDekCache.has(share.id)) {
+            return this._sharedDekCache.get(share.id);
+        }
+        try {
+            const recipientUserId = await this._getCurrentUserId();
+            if (!recipientUserId) return null;
+            // The recipient's OWN identity secret (NOT their budget DEK).
+            const identityKeys = await this._budgetKeyService()._getIdentitySecret(recipientUserId);
+            const ownerDek = this._budgetCryptoService().unsealDEK(
+                { wrapped_dek: share.wrapped_dek, wrap_nonce: share.wrap_nonce, wrap_eph_pub: share.wrap_eph_pub },
+                identityKeys
+            );
+            this._sharedDekCache.set(share.id, ownerDek);
+            return ownerDek;
+        } catch (e) {
+            console.warn(`[DatabaseService] _unsealOwnerDekFromShare: could not unseal owner DEK for share ${share && share.id} — shared rows will skip:`, e && e.message);
+            return null;
+        }
+    },
+
     /**
      * Transform month data from database format to application format
      * @param {Object} dbRecord - Database record
      * @returns {Object} Application format month data
      */
-    transformMonthFromDatabase(dbRecord) {
+    transformMonthFromDatabase(dbRecord, dekOverride = null) {
         // ---- S5 dual-read: encrypted (enc_version >= 1) vs legacy plaintext (0/null) ----
         // An encrypted row stores ALL seven sensitive fields inside enc_payload and
         // leaves the legacy plaintext columns NULL. A legacy row (enc_version 0/absent,
         // no enc_payload) is read exactly as before. This window lets old rows AND new
         // rows render side by side during migration (design §3.2 / §6).
+        //
+        // S7: dekOverride lets the SHARED-read path decrypt an OWNER's row with the
+        // OWNER's DEK (unsealed from the share), instead of this user's own DEK. The
+        // own-data path passes nothing and uses _requireBudgetDek() unchanged.
         let sensitive;
         if ((dbRecord.enc_version || 0) >= 1 && dbRecord.enc_payload) {
             // Decrypt the single per-row blob. decryptBlob fails CLOSED on a wrong key
@@ -2913,7 +3069,7 @@ const DatabaseService = {
             // blanks a budget (design §3.3). Wrap to make the failure attributable.
             let dek;
             try {
-                dek = this._requireBudgetDek();
+                dek = dekOverride || this._requireBudgetDek();
             } catch (keyErr) {
                 throw this._wrapBudgetDecryptError(keyErr, dbRecord, 'month');
             }
@@ -3052,12 +3208,14 @@ const DatabaseService = {
      * @param {Object} dbRecord - Database record
      * @returns {Object} Application format pot data
      */
-    transformPotFromDatabase(dbRecord) {
+    transformPotFromDatabase(dbRecord, dekOverride = null) {
         // ---- S5 dual-read (pots): encrypted vs legacy plaintext ----
+        // S7: dekOverride lets the SHARED-read path decrypt an OWNER's pot with the
+        // OWNER's DEK (unsealed from the share); own-data path uses _requireBudgetDek().
         if ((dbRecord.enc_version || 0) >= 1 && dbRecord.enc_payload) {
             let dek;
             try {
-                dek = this._requireBudgetDek();
+                dek = dekOverride || this._requireBudgetDek();
             } catch (keyErr) {
                 throw this._wrapBudgetDecryptError(keyErr, dbRecord, 'pot');
             }
@@ -3778,6 +3936,44 @@ const DatabaseService = {
                 } else {
                     share = result.data && result.data.length > 0 ? result.data[0] : null;
                     console.log('[DatabaseService] Share created successfully');
+                }
+            }
+
+            // ---- S7: seal the OWNER's budget DEK to the RECIPIENT's identity pubkey ----
+            // (BUDGET_E2E_DESIGN.md §2.5 / §7). Without this the recipient holds an
+            // RLS grant to the owner's ciphertext rows but cannot DECRYPT them. We seal
+            // the owner's DEK with nacl box (ephemeral keypair -> recipient identity
+            // pubkey) and persist the three columns on the share row, so the recipient
+            // can unseal with their identity secret. Best-effort + additive: if the
+            // recipient has no published identity yet (or the owner DEK is unavailable),
+            // _sealShareDekForRecipient returns null and we leave the share un-sealed —
+            // the recipient simply cannot decrypt yet (H11 per-row skip), and a later
+            // re-share once they have an identity will seal it. Re-sealing on every
+            // create/update is intentional: a fresh ephemeral seal each time keeps the
+            // wrapped DEK current and is harmless (same DEK, new ephemeral).
+            if (share && share.id) {
+                try {
+                    const sealed = await this._sealShareDekForRecipient(currentUserId, userResult.userId);
+                    if (sealed) {
+                        const sealUpdate = await this.queryUpdate(tableName, share.id, {
+                            wrapped_dek: sealed.wrapped_dek,
+                            wrap_nonce: sealed.wrap_nonce,
+                            wrap_eph_pub: sealed.wrap_eph_pub,
+                        });
+                        if (sealUpdate.error) {
+                            console.warn('[DatabaseService] S7: failed to persist sealed DEK on share (recipient cannot decrypt until re-shared):', sealUpdate.error.message || sealUpdate.error.code);
+                        } else {
+                            // reflect on the returned share object
+                            share.wrapped_dek = sealed.wrapped_dek;
+                            share.wrap_nonce = sealed.wrap_nonce;
+                            share.wrap_eph_pub = sealed.wrap_eph_pub;
+                            console.log('[DatabaseService] S7: sealed owner DEK to recipient identity on share', share.id);
+                        }
+                    }
+                } catch (sealErr) {
+                    // Never fail share creation on a seal error — the share still exists
+                    // (with RLS access); only decryption is gated on the seal.
+                    console.warn('[DatabaseService] S7: exception sealing DEK to recipient (share left un-sealed):', sealErr && sealErr.message);
                 }
             }
 
