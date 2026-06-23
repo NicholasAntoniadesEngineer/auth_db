@@ -6,9 +6,22 @@
  * Algorithms:
  * - Key Generation: X25519 (Curve25519)
  * - Key Agreement: ECDH (Elliptic Curve Diffie-Hellman)
+ * - Raw DH: X25519 scalar multiplication (for ratchet / X3DH) -- see dhRaw()
+ * - Signatures: Ed25519 (for signed prekeys) -- see signKeyPair/signDetached/verifyDetached()
  * - Encryption: XSalsa20-Poly1305 (authenticated encryption)
  * - Hashing: SHA-512 (for safety numbers)
+ *
+ * SEEDABLE RNG SEAM (S0):
+ *   All randomness used by ephemeral key generation and the 24-byte secretbox
+ *   nonce is routed through a single module-level source so that tests can
+ *   inject a deterministic generator (frozen-seed gates for FS/PCS proofs).
+ *   Production default is crypto-secure (nacl.randomBytes). Override only in
+ *   tests via setRandomBytesSource()/resetRandomBytesSource().
  */
+
+// Module-level, overridable random-bytes source. `null` => use the secure
+// default (nacl.randomBytes). A test may set this to a deterministic generator.
+let _randomBytesSource = null;
 
 const CryptoPrimitivesService = {
     /**
@@ -58,12 +71,19 @@ const CryptoPrimitivesService = {
     // ==================== Key Generation ====================
 
     /**
-     * Generate a new X25519 key pair
+     * Generate a new X25519 key pair.
+     *
+     * Routed through the seedable RNG seam (randomBytes -> keyPairFromSecretKey)
+     * rather than nacl.box.keyPair(), so that ephemeral ratchet keys are
+     * deterministic under an injected RNG source in tests. X25519 clamps the
+     * scalar internally, so any 32 random bytes are a valid secret key.
+     *
      * @returns {Object} { publicKey: Uint8Array, secretKey: Uint8Array }
      */
     generateKeyPair() {
         this._ensureInitialized();
-        return this.nacl.box.keyPair();
+        const secretKey = this.randomBytes(32);
+        return this.nacl.box.keyPair.fromSecretKey(secretKey);
     },
 
     /**
@@ -78,13 +98,54 @@ const CryptoPrimitivesService = {
     },
 
     /**
-     * Generate random bytes
+     * Generate random bytes.
+     *
+     * Routes through the seedable RNG seam: if a deterministic source has been
+     * installed via setRandomBytesSource() it is used, otherwise the secure
+     * default (nacl.randomBytes) is used. This is the single choke-point for ALL
+     * randomness in the encryption stack (ephemeral keygen + secretbox nonces),
+     * which is what makes the ratchet's FS/PCS test gates deterministic.
+     *
      * @param {number} length - Number of bytes
-     * @returns {Uint8Array} Random bytes
+     * @returns {Uint8Array} Random bytes (length `length`)
      */
     randomBytes(length) {
+        if (_randomBytesSource) {
+            const out = _randomBytesSource(length);
+            if (!(out instanceof Uint8Array) || out.length !== length) {
+                throw new Error(
+                    `[CryptoPrimitivesService] Injected randomBytes source returned ` +
+                    `${out && out.length} bytes, expected ${length}`
+                );
+            }
+            return out;
+        }
         this._ensureInitialized();
         return this.nacl.randomBytes(length);
+    },
+
+    /**
+     * Install a deterministic random-bytes source (TEST ONLY).
+     *
+     * Production code must never call this. When set, every randomBytes() call
+     * (and therefore every ephemeral keypair and every secretbox nonce that
+     * goes through this service) becomes deterministic, enabling frozen-seed
+     * test vectors and the forward-secrecy / PCS proof gates.
+     *
+     * @param {function(number): Uint8Array} fn - generator: length -> bytes
+     */
+    setRandomBytesSource(fn) {
+        if (typeof fn !== 'function') {
+            throw new Error('[CryptoPrimitivesService] setRandomBytesSource requires a function');
+        }
+        _randomBytesSource = fn;
+    },
+
+    /**
+     * Restore the secure default random-bytes source (TEST ONLY).
+     */
+    resetRandomBytesSource() {
+        _randomBytesSource = null;
     },
 
     // ==================== Key Agreement ====================
@@ -100,6 +161,75 @@ const CryptoPrimitivesService = {
         return this.nacl.box.before(theirPublicKey, ourSecretKey);
     },
 
+    /**
+     * Raw X25519 Diffie-Hellman (scalar multiplication).
+     *
+     * This is the bare DH the Double Ratchet / X3DH specs assume: the 32-byte
+     * shared curve point with NO further keying applied. It is DISTINCT from
+     * deriveSharedSecret() above, which uses nacl.box.before -- that variant
+     * additionally runs HSalsa20 over the point (a keyed PRF), which is NOT the
+     * spec's DH() output. The ratchet feeds dhRaw()'s result strictly as HKDF
+     * IKM, so we must use the raw scalarMult here.
+     *
+     * @param {Uint8Array} ourSecretKey - Our 32-byte X25519 secret key
+     * @param {Uint8Array} theirPublicKey - Their 32-byte X25519 public key
+     * @returns {Uint8Array} 32-byte raw shared point (HKDF IKM only)
+     */
+    dhRaw(ourSecretKey, theirPublicKey) {
+        this._ensureInitialized();
+        return this.nacl.scalarMult(ourSecretKey, theirPublicKey);
+    },
+
+    // ==================== Ed25519 Signatures (signed prekeys) ====================
+    //
+    // A SEPARATE keypair from the X25519 box/identity key. The X25519 box key
+    // can NOT sign; we never reuse it for signing. Used for X3DH signed prekeys.
+
+    /**
+     * Generate a new Ed25519 signing key pair.
+     * @returns {Object} { publicKey: Uint8Array(32), secretKey: Uint8Array(64) }
+     */
+    signKeyPair() {
+        this._ensureInitialized();
+        // Route the 32-byte seed through the seedable RNG seam so signing keys
+        // are deterministic under an injected RNG source in tests.
+        const seed = this.randomBytes(32);
+        return this.nacl.sign.keyPair.fromSeed(seed);
+    },
+
+    /**
+     * Derive an Ed25519 signing key pair from a 32-byte seed (deterministic).
+     * @param {Uint8Array} seed - 32-byte seed
+     * @returns {Object} { publicKey: Uint8Array(32), secretKey: Uint8Array(64) }
+     */
+    signKeyPairFromSeed(seed) {
+        this._ensureInitialized();
+        return this.nacl.sign.keyPair.fromSeed(seed);
+    },
+
+    /**
+     * Produce a detached Ed25519 signature over a message.
+     * @param {Uint8Array} message - Bytes to sign
+     * @param {Uint8Array} signingSecretKey - 64-byte Ed25519 secret key
+     * @returns {Uint8Array} 64-byte detached signature
+     */
+    signDetached(message, signingSecretKey) {
+        this._ensureInitialized();
+        return this.nacl.sign.detached(message, signingSecretKey);
+    },
+
+    /**
+     * Verify a detached Ed25519 signature (constant-time inside nacl).
+     * @param {Uint8Array} message - Bytes that were signed
+     * @param {Uint8Array} signature - 64-byte detached signature
+     * @param {Uint8Array} signingPublicKey - 32-byte Ed25519 public key
+     * @returns {boolean} True iff the signature is valid
+     */
+    verifyDetached(message, signature, signingPublicKey) {
+        this._ensureInitialized();
+        return this.nacl.sign.detached.verify(message, signature, signingPublicKey);
+    },
+
     // ==================== Authenticated Encryption ====================
 
     /**
@@ -111,7 +241,8 @@ const CryptoPrimitivesService = {
     encrypt(plaintext, key) {
         this._ensureInitialized();
 
-        const nonce = this.nacl.randomBytes(24);
+        // Route the 24-byte nonce through the seedable RNG seam (deterministic in tests).
+        const nonce = this.randomBytes(24);
         const message = this.nacl.util.decodeUTF8(plaintext);
         const ciphertext = this.nacl.secretbox(message, nonce, key);
 
@@ -152,7 +283,8 @@ const CryptoPrimitivesService = {
     encryptBytes(message, key) {
         this._ensureInitialized();
 
-        const nonce = this.nacl.randomBytes(24);
+        // Route the 24-byte nonce through the seedable RNG seam (deterministic in tests).
+        const nonce = this.randomBytes(24);
         const ciphertext = this.nacl.secretbox(message, nonce, key);
 
         return { ciphertext, nonce };
