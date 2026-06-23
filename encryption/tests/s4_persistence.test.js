@@ -204,45 +204,47 @@ async function main() {
     });
 
     // =====================================================================
-    await H.gate('S4 (4) skipped_message_keys round-trip + consume-once + MAX_SKIP fail-closed', async () => {
+    // NOTE: the standalone skipped_message_keys per-key helpers
+    // (put/get/delete/count) + MAX_SKIPPED_KEYS_PER_CONVERSATION were REMOVED
+    // (P1-1 cleanup): the LIVE path persists skipped keys INSIDE the ratchet_states
+    // blob (covered by gates 1-3) and bounds their total via the ratchet's
+    // MAX_SKIPPED_TOTAL (see s9_skip_bound.test.js). The skipped_message_keys OBJECT
+    // STORE is retained (used by the S7 snapshot + clearAll); this gate proves the
+    // RETAINED store still round-trips via the generic path S7/clearAll use (a direct
+    // wrapped put + getAll), which is the only contract the store still has.
+    await H.gate('S4 (4) retained skipped_message_keys store: generic wrapped round-trip (S7/clearAll contract)', async () => {
         const mk = CP.randomBytes(32);
         const ratchetPub = CP.serializeKey(CP.generateKeyPair().publicKey);
+        const db = KeyStorageService.db;
 
-        await KeyStorageService.putSkippedMessageKey('conv-S', ratchetPub, 7, mk);
-        const got = await KeyStorageService.getSkippedMessageKey('conv-S', ratchetPub, 7);
-        H.assertBytesEqual(got, mk, 'skipped key round-trips byte-identical (wrapped)');
+        // The store still exists (schema unchanged — NOT dropped).
+        H.assert(db.objectStoreNames.contains('skipped_message_keys'),
+            'skipped_message_keys object store is retained (no schema change)');
 
-        // wrong coordinates -> null
-        H.assertEqual(await KeyStorageService.getSkippedMessageKey('conv-S', ratchetPub, 8), null, 'miss -> null');
+        // Write a wrapped record exactly the way importRatchetSnapshot does (direct
+        // store.put of a {conversationId,ratchetPub,msgNum,wrappedKey,wrapIv} record).
+        const { wrapped, iv } = await KeyStorageService._wrapSecret(mk);
+        await new Promise((res, rej) => {
+            const tx = db.transaction('skipped_message_keys', 'readwrite');
+            const r = tx.objectStore('skipped_message_keys').put({
+                conversationId: 'conv-S', ratchetPub, msgNum: 7,
+                wrappedKey: wrapped, wrapIv: iv, createdAt: new Date().toISOString()
+            });
+            r.onsuccess = () => res(); r.onerror = () => rej(r.error);
+        });
 
-        // consume-once
-        await KeyStorageService.deleteSkippedMessageKey('conv-S', ratchetPub, 7);
-        H.assertEqual(await KeyStorageService.getSkippedMessageKey('conv-S', ratchetPub, 7), null, 'deleted skipped key gone');
+        // exportRatchetSnapshot reads via _getAllRecords -> getAll(); confirm it sees it
+        // and that the bytes are wrapped at rest (no plaintext MK in the blob).
+        const recs = await KeyStorageService._getAllRecords('skipped_message_keys');
+        const rec = recs.find(r => r.conversationId === 'conv-S' && r.ratchetPub === ratchetPub && r.msgNum === 7);
+        H.assert(!!rec, 'generic getAll sees the wrapped skipped record (S7 export path)');
+        const blob = Buffer.from(new Uint8Array(rec.wrappedKey));
+        H.assert(!blob.includes(Buffer.from(mk)), 'skipped record wrapped at rest (no plaintext MK in blob)');
 
-        // MAX_SKIP bound: lower it for a fast test, fill to cap, assert NEW key throws,
-        // but updating an EXISTING (pub,n) at cap is still allowed.
-        const saved = KeyStorageService.MAX_SKIPPED_KEYS_PER_CONVERSATION;
-        KeyStorageService.MAX_SKIPPED_KEYS_PER_CONVERSATION = 3;
-        try {
-            for (let i = 0; i < 3; i++) {
-                await KeyStorageService.putSkippedMessageKey('conv-CAP', ratchetPub, i, CP.randomBytes(32));
-            }
-            let threw = false;
-            try {
-                await KeyStorageService.putSkippedMessageKey('conv-CAP', ratchetPub, 99, CP.randomBytes(32));
-            } catch (e) { threw = (e.code === 'MAX_SKIP_EXCEEDED'); }
-            H.assert(threw, 'new skipped key beyond cap throws MAX_SKIP_EXCEEDED (fail closed)');
-
-            // overwrite an existing coordinate at cap -> allowed (not a new entry)
-            let okUpdate = true;
-            try {
-                await KeyStorageService.putSkippedMessageKey('conv-CAP', ratchetPub, 1, CP.randomBytes(32));
-            } catch (e) { okUpdate = false; }
-            H.assert(okUpdate, 'updating an existing skipped coordinate at cap is allowed');
-        } finally {
-            KeyStorageService.MAX_SKIPPED_KEYS_PER_CONVERSATION = saved;
-        }
-        process.stdout.write('  skipped store wraps, consumes once, and enforces the MAX_SKIP bound.\n');
+        // And it unwraps byte-identical (wrap is sound).
+        const back = await KeyStorageService._unwrapSecret(rec.wrappedKey, rec.wrapIv);
+        H.assertBytesEqual(back, mk, 'wrapped skipped record unwraps byte-identical');
+        process.stdout.write('  retained skipped store: wrapped generic round-trip ok; live bound is now in the ratchet.\n');
     });
 
     // =====================================================================
@@ -275,7 +277,19 @@ async function main() {
     await H.gate('S4 (6) clearAll wipes the 3 new stores but PRESERVES wrap_keys', async () => {
         // seed all three stores + the wrap key
         await KeyStorageService.putRatchetState('conv-CLR', await buildPopulatedState('clr-seed'));
-        await KeyStorageService.putSkippedMessageKey('conv-CLR', CP.serializeKey(CP.generateKeyPair().publicKey), 1, CP.randomBytes(32));
+        // seed the retained skipped_message_keys store via a direct wrapped put (the
+        // per-key helper was removed; clearAll must still wipe the store).
+        {
+            const { wrapped, iv } = await KeyStorageService._wrapSecret(CP.randomBytes(32));
+            await new Promise((res, rej) => {
+                const tx = KeyStorageService.db.transaction('skipped_message_keys', 'readwrite');
+                const r = tx.objectStore('skipped_message_keys').put({
+                    conversationId: 'conv-CLR', ratchetPub: CP.serializeKey(CP.generateKeyPair().publicKey),
+                    msgNum: 1, wrappedKey: wrapped, wrapIv: iv, createdAt: new Date().toISOString()
+                });
+                r.onsuccess = () => res(); r.onerror = () => rej(r.error);
+            });
+        }
         await KeyStorageService.putDecryptedMessageKey('msg-CLR', CP.randomBytes(32), 'conv-CLR');
         // force a wrap key to exist
         await KeyStorageService._getOrCreateWrapKey();
@@ -292,6 +306,8 @@ async function main() {
 
         H.assertEqual(await KeyStorageService.getRatchetState('conv-CLR'), null, 'ratchet_states cleared');
         H.assertEqual(await KeyStorageService.getDecryptedMessageKey('msg-CLR'), null, 'archive cleared');
+        const skippedAfter = await KeyStorageService._getAllRecords('skipped_message_keys');
+        H.assertEqual(skippedAfter.length, 0, 'skipped_message_keys store cleared (retained store still wiped by clearAll)');
 
         const wrapAfter = await new Promise((res, rej) => {
             const tx = db.transaction('wrap_keys', 'readonly');

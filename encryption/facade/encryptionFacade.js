@@ -250,6 +250,22 @@ const EncryptionFacade = {
     },
 
     /**
+     * Read a peer's PENDING (newly server-advertised) identity WITHOUT pinning it, so
+     * the UI can show the NEW key's safety number to verify out-of-band before
+     * accepting a pending identity change (P0-follow-up). getSafetyNumber throws while
+     * a change is pending (fail-closed); this read-only method does not, and never
+     * re-pins — a subsequent establishSession still fails closed until accept.
+     * @param {string} otherUserId - Peer user id
+     * @returns {Promise<{userId,changed,oldFingerprint,newFingerprint,oldSafetyNumber,newSafetyNumber}>}
+     */
+    async getPendingPeerIdentity(otherUserId) {
+        if (!this.initialized || !this._keysExist) {
+            throw new Error('[EncryptionFacade] Encryption not set up');
+        }
+        return await KeyManagementService.getPendingPeerIdentity(otherUserId);
+    },
+
+    /**
      * Adopt a CHANGED peer identity after the user has verified it out-of-band
      * (compared the safety number). Re-pins the peer's new X25519 IK + Ed25519
      * IK_sig, clearing the fail-closed PeerIdentityChangedError block so the next

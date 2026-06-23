@@ -68,12 +68,21 @@ class FakeIndex {
         this.store = store;
         this.keyPath = keyPath;
     }
+    // Extract a record's value for THIS index's keyPath. Mirrors real IndexedDB:
+    // a compound (array) keyPath yields the array of the named fields' values, so
+    // an index on ['userId','kind'] matches a query value of [userId, kind].
+    _recordIndexValue(rec) {
+        if (Array.isArray(this.keyPath)) {
+            return JSON.stringify(this.keyPath.map((p) => rec[p]));
+        }
+        return JSON.stringify(rec[this.keyPath]);
+    }
     getAll(value) {
         const req = new FakeRequest();
         const wanted = JSON.stringify(value);
         const out = [];
         for (const rec of this.store._data.values()) {
-            if (JSON.stringify(rec[this.keyPath]) === wanted) out.push(rec);
+            if (this._recordIndexValue(rec) === wanted) out.push(rec);
         }
         req._succeed(out);
         return req;
@@ -83,7 +92,7 @@ class FakeIndex {
         const wanted = range == null ? null : range._only;
         let n = 0;
         for (const rec of this.store._data.values()) {
-            if (wanted == null || JSON.stringify(rec[this.keyPath]) === JSON.stringify(wanted)) n++;
+            if (wanted == null || this._recordIndexValue(rec) === JSON.stringify(wanted)) n++;
         }
         req._succeed(n);
         return req;

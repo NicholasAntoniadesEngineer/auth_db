@@ -40,7 +40,19 @@
 (function () {
     'use strict';
 
+    // MAX_SKIP bounds a SINGLE chain advance (refusing a malicious huge header.n).
+    // MAX_SKIPPED_TOTAL bounds the LIVE MKSKIPPED map ACROSS all DH ratchets: a DH
+    // ratchet resets Nr but never prunes the previous chain's (oldDHr, n) entries,
+    // so without a total cap the map — and the persisted ratchet_states blob — grows
+    // unbounded over a long-lived conversation. Signal keeps BOTH bounds for exactly
+    // this reason (per-chain skip limit + a global stored-skipped-key limit). When the
+    // map exceeds MAX_SKIPPED_TOTAL we evict the OLDEST entries by INSERTION ORDER
+    // (JS Map preserves insertion order), so a freshly-derived NEWER key is never lost
+    // to make room — only the stalest skipped keys (least likely to still be needed)
+    // are dropped. LAW 0: this never touches a chain key or the netlist of derivations;
+    // it only caps a recovery-cache of already-derived message keys.
     const MAX_SKIP = 1000;
+    const MAX_SKIPPED_TOTAL = 2000;
 
     // Info strings (domain separation). Frozen -- changing these breaks the KAT.
     const INFO_RK   = 'MoneyTracker:RK:v1';
@@ -189,6 +201,22 @@
     }
     function skipKey(dhPub, n) { return b64(dhPub) + '|' + n; }
 
+    /**
+     * Enforce the TOTAL live-skipped-key cap (MAX_SKIPPED_TOTAL) on a state's
+     * MKSKIPPED map, evicting the OLDEST entries (insertion order) until it fits.
+     * JS Map iteration is insertion-ordered, so .keys().next() is the oldest; a
+     * just-inserted (newest) key is therefore never evicted before older ones.
+     * No-op when already within the cap. Mutates the passed (already-cloned) state.
+     */
+    function capSkipped(s) {
+        if (!s.MKSKIPPED) return;
+        while (s.MKSKIPPED.size > MAX_SKIPPED_TOTAL) {
+            const oldest = s.MKSKIPPED.keys().next().value;
+            if (oldest === undefined) break;
+            s.MKSKIPPED.delete(oldest);
+        }
+    }
+
     // =======================================================================
     // INIT
     // =======================================================================
@@ -290,6 +318,10 @@
             s.CKr = CK;
             s.MKSKIPPED.set(skipKey(s.DHr, s.Nr), MK);
             s.Nr += 1;
+            // Total cap (distinct from MAX_SKIP): evict the OLDEST skipped keys so the
+            // live map / persisted blob cannot grow unbounded across DH ratchets. The
+            // key we just inserted is the newest, so it survives the eviction.
+            capSkipped(s);
         }
     }
 
@@ -368,6 +400,7 @@
 
     const DoubleRatchetService = {
         MAX_SKIP: MAX_SKIP,
+        MAX_SKIPPED_TOTAL: MAX_SKIPPED_TOTAL,
         ratchetInitAlice: ratchetInitAlice,
         ratchetInitBob: ratchetInitBob,
         ratchetEncrypt: ratchetEncrypt,

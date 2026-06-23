@@ -755,6 +755,32 @@ const KeyManagementService = {
     OPK_LOW_WATER: 5,
 
     /**
+     * Signed-prekey (SPK) rotation policy (P2-1, FORWARD_SECRECY_DESIGN §2.3).
+     *
+     *  SPK_ROTATION_MS — mint+publish a FRESH SPK once the current one is older than
+     *    this (default 7 days). Periodic rotation limits the window in which a single
+     *    compromised SPK secret can be used to bootstrap responder sessions.
+     *
+     *  SPK_GRACE_MS — keep a PREVIOUS (rotated-out) SPK secret locally for this long
+     *    AFTER it stops being the advertised one (default 2 days) so an in-flight
+     *    INITIATOR that already fetched the OLD SPK (the server advertises only the
+     *    latest) can still bootstrap: the responder looks up its SPK secret by the
+     *    spk_id named in the preamble, and multiple stored SPKs are supported.
+     *
+     *  No createdAt-relative subtlety leaks into the API: an SPK created at T was the
+     *  active/advertised one until ~T+SPK_ROTATION_MS (when the next rotation fires),
+     *  so its grace expires at ~T+SPK_ROTATION_MS+SPK_GRACE_MS. _pruneExpiredSignedPrekeys
+     *  therefore prunes a NON-current SPK once its CREATION age exceeds
+     *  (SPK_ROTATION_MS + SPK_GRACE_MS) — i.e. grace measured from when it was retired,
+     *  not from when it was minted (otherwise a just-rotated SPK, already older than the
+     *  rotation interval, would be pruned instantly and the grace would be a no-op).
+     *
+     *  Server holds only the latest SPK row (no schema change); old secrets stay local.
+     */
+    SPK_ROTATION_MS: 7 * 24 * 60 * 60 * 1000,
+    SPK_GRACE_MS: 2 * 24 * 60 * 60 * 1000,
+
+    /**
      * HKDF info that derives the Ed25519 IK_sig SEED from the X25519 identity
      * secret. A SEPARATE keypair (Ed25519, for signing) is required — the X25519
      * box key cannot sign — but deriving its seed deterministically from the
@@ -820,27 +846,48 @@ const KeyManagementService = {
         const identitySignPubB64 = CryptoPrimitivesService.serializeKey(signKeys.publicKey);
 
         // --- Signed prekey (SPK): fresh X25519 keypair, signed by IK_sig. ---
-        // Reuse the existing published SPK if one already exists locally + on the
-        // server (don't rotate on every login); otherwise mint + publish a new one.
-        let spkId = await KeyStorageService.getCurrentSignedPrekeyId(this.currentUserId);
+        // PERIODIC rotation with a grace window (P2-1). Mint a NEW SPK when:
+        //   (1) none exists yet, OR
+        //   (2) the local secret for the current id is gone, OR
+        //   (3) the current SPK is OLDER than SPK_ROTATION_MS (age-based rotation).
+        // Otherwise reuse it (don't rotate on every login). Multiple SPK secrets are
+        // kept locally during grace so an in-flight initiator that fetched the OLD
+        // SPK can still bootstrap; secrets past SPK_GRACE_MS are pruned afterwards.
+        const now = Date.now();
+        const spkMeta = await KeyStorageService.getSignedPrekeyMeta(this.currentUserId); // newest-first
+        const current = spkMeta.length ? spkMeta[0] : null;
+
+        let spkId = current ? current.keyId : null;
         let needNewSpk = (spkId === null || spkId === undefined);
         if (!needNewSpk) {
             // Verify the local SPK secret is still present (else mint a new one).
             const localSpk = await KeyStorageService.getSignedPrekey(this.currentUserId, spkId);
-            if (!localSpk) needNewSpk = true;
+            if (!localSpk) {
+                needNewSpk = true;
+            } else if (current.createdAt) {
+                // Age-based rotation: rotate once the current SPK exceeds the interval.
+                const ageMs = now - Date.parse(current.createdAt);
+                if (Number.isFinite(ageMs) && ageMs >= this.SPK_ROTATION_MS) {
+                    needNewSpk = true;
+                    console.log(`[KeyManagementService] SPK age ${Math.round(ageMs / 86400000)}d >= rotation interval — rotating`);
+                }
+            }
         }
 
         if (needNewSpk) {
-            spkId = Date.now() & 0x7fffffff; // monotonic-ish 31-bit rotation id
+            spkId = now & 0x7fffffff; // monotonic-ish 31-bit rotation id
             const spk = CryptoPrimitivesService.generateKeyPair();
             const spkSig = CryptoPrimitivesService.signDetached(spk.publicKey, signKeys.secretKey);
 
-            // Persist the SPK SECRET locally (wrapped) keyed by spkId.
+            // Persist the SPK SECRET locally (wrapped) keyed by spkId. The PREVIOUS
+            // SPK secret(s) are intentionally NOT deleted here — they remain valid for
+            // in-flight initiators until the grace prune below removes the truly-old ones.
             await KeyStorageService.putSignedPrekey(this.currentUserId, spkId, spk);
 
             const spkPubB64 = CryptoPrimitivesService.serializeKey(spk.publicKey);
             const spkSigB64 = CryptoPrimitivesService.serializeKey(spkSig);
 
+            // Server advertises ONLY the latest SPK (one row per user; no schema change).
             const result = await this._database.queryUpsert(prekeysTable, {
                 user_id: this.currentUserId,
                 identity_sign_pub: identitySignPubB64,
@@ -855,10 +902,52 @@ const KeyManagementService = {
             console.log(`[KeyManagementService] Published signed prekey spk_id=${spkId}`);
         }
 
+        // --- Grace-window prune: drop SPK secrets older than SPK_GRACE_MS, but NEVER
+        // the current (just-published / still-advertised) one. Keeps the retained-secret
+        // window bounded while letting an in-flight initiator on the OLD SPK still mate.
+        await this._pruneExpiredSignedPrekeys(spkId, now);
+
         // --- One-time prekeys (OPK) pool replenishment. ---
         const opkPublished = await this._replenishOneTimePrekeys();
 
         return { success: true, spkId, opkPublished };
+    },
+
+    /**
+     * Prune locally-stored signed-prekey SECRETS older than SPK_GRACE_MS, EXCEPT the
+     * currently-advertised one (P2-1). The grace window keeps a just-rotated old SPK
+     * usable by an in-flight initiator that already fetched it; once a secret is older
+     * than the window it can no longer correspond to a reasonably in-flight bootstrap,
+     * so deleting it bounds the retained-secret exposure. Best-effort + idempotent:
+     * pruning failures never block publishPrekeys. Returns the count pruned.
+     * @private
+     * @param {number} currentSpkId - the id to ALWAYS keep (current/advertised SPK)
+     * @param {number} [nowMs] - clock (injectable for tests)
+     * @returns {Promise<number>}
+     */
+    async _pruneExpiredSignedPrekeys(currentSpkId, nowMs) {
+        const now = (typeof nowMs === 'number') ? nowMs : Date.now();
+        // Grace measured from RETIREMENT, not minting: a non-current SPK is kept until
+        // its creation age exceeds (rotation interval + grace), since it remained the
+        // advertised one for ~rotation interval before being rotated out.
+        const pruneAfterMs = this.SPK_ROTATION_MS + this.SPK_GRACE_MS;
+        let pruned = 0;
+        try {
+            const meta = await KeyStorageService.getSignedPrekeyMeta(this.currentUserId);
+            for (const m of meta) {
+                if (m.keyId === (currentSpkId | 0)) continue; // never prune the current SPK
+                if (!m.createdAt) continue;                   // no timestamp -> keep (be safe)
+                const ageMs = now - Date.parse(m.createdAt);
+                if (Number.isFinite(ageMs) && ageMs >= pruneAfterMs) {
+                    await KeyStorageService.deleteSignedPrekey(this.currentUserId, m.keyId);
+                    pruned += 1;
+                    console.log(`[KeyManagementService] Pruned expired SPK secret spk_id=${m.keyId} (age ${Math.round(ageMs / 86400000)}d > rotation+grace)`);
+                }
+            }
+        } catch (e) {
+            console.warn('[KeyManagementService] SPK grace prune failed (non-fatal):', e.message);
+        }
+        return pruned;
     },
 
     /**
@@ -1735,6 +1824,66 @@ const KeyManagementService = {
         const theirPublicKey = CryptoPrimitivesService.deserializeKey(theirPublicKeyB64);
 
         return CryptoPrimitivesService.generateSafetyNumber(ourKeys.publicKey, theirPublicKey);
+    },
+
+    /**
+     * Read a peer's CURRENTLY server-advertised X25519 identity WITHOUT pinning it,
+     * so the UI can show the user the NEW key's safety number to verify out-of-band
+     * BEFORE accepting a pending identity change (P0-follow-up).
+     *
+     * After the fail-closed fix, getSafetyNumber -> _getPinnedPeerKey THROWS while a
+     * change is pending (the whole point: never derive against an unverified key). But
+     * the user still needs to SEE the new safety number to compare it. This method is
+     * the read-only escape hatch: it fetches the fresh server key directly (NOT through
+     * the pinning chokepoint), computes its fingerprint + safety number, and reports
+     * whether it differs from the pinned key. It NEVER writes the pin — a subsequent
+     * establishSession STILL fails closed until acceptPeerIdentityChange() is called.
+     *
+     * @param {string} otherUserId - Peer user id
+     * @returns {Promise<{
+     *   userId:string, changed:boolean,
+     *   oldFingerprint:string|null, newFingerprint:string|null,
+     *   oldSafetyNumber:string|null, newSafetyNumber:string|null
+     * }>}
+     */
+    async getPendingPeerIdentity(otherUserId) {
+        if (!otherUserId) {
+            throw new Error('[KeyManagementService] getPendingPeerIdentity requires a userId');
+        }
+        const ourKeys = await KeyStorageService.getIdentityKeys(this.currentUserId);
+        if (!ourKeys) {
+            throw new Error('No local identity keys');
+        }
+
+        // NEW key: fetch DIRECTLY from the server (bypass _getPinnedPeerKey so this is
+        // a pure read that never throws on a change and never re-pins).
+        const fetchedB64 = await HistoricalKeysService.getCurrentKey(otherUserId);
+
+        // OLD key: whatever we currently have pinned (what we actually encrypt to).
+        const pinned = await KeyStorageService.getPinnedKey(otherUserId);
+
+        const fpOf = (b64) => CryptoPrimitivesService.getKeyFingerprint(
+            CryptoPrimitivesService.deserializeKey(b64)
+        );
+        const safetyOf = (b64) => CryptoPrimitivesService.generateSafetyNumber(
+            ourKeys.publicKey, CryptoPrimitivesService.deserializeKey(b64)
+        );
+
+        const oldFingerprint = pinned ? pinned.fingerprint : null;
+        const oldSafetyNumber = pinned ? safetyOf(pinned.publicKey) : null;
+        const newFingerprint = fetchedB64 ? fpOf(fetchedB64) : null;
+        const newSafetyNumber = fetchedB64 ? safetyOf(fetchedB64) : null;
+
+        const changed = !!(pinned && fetchedB64 && pinned.publicKey !== fetchedB64);
+
+        return {
+            userId: otherUserId,
+            changed,
+            oldFingerprint,
+            newFingerprint,
+            oldSafetyNumber,
+            newSafetyNumber
+        };
     },
 
     /**

@@ -909,22 +909,25 @@ const KeyStorageService = {
 
     // ==================== Ratchet State Persistence (S4) ====================
     //
-    // FORWARD_SECRECY_DESIGN §4.5 + §5. Three stores, all secret-bearing fields
-    // wrapped at rest with the SM-02 wrap key (via _wrapSecret/_unwrapSecret):
+    // FORWARD_SECRECY_DESIGN §4.5 + §5. Two stores written by the LIVE path, all
+    // secret-bearing fields wrapped at rest with the SM-02 wrap key (via
+    // _wrapSecret/_unwrapSecret):
     //   ratchet_states         -> the serialized Double Ratchet state per convo
-    //   skipped_message_keys   -> (peer ratchet pub, msg num) -> MK, bounded
+    //                             (the MKSKIPPED map is persisted INSIDE this blob;
+    //                              its TOTAL size is bounded by the ratchet itself —
+    //                              DoubleRatchetService.MAX_SKIPPED_TOTAL eviction)
     //   decrypted_message_keys -> per-message-key ARCHIVE, message id -> MK
     //
-    // NOTE: these helpers only persist/serialize. They do NOT advance the ratchet
-    // and are NOT yet wired into encrypt/decrypt (that is S5/S6).
-
-    /**
-     * Upper bound on persisted skipped message keys per conversation. Mirrors the
-     * DoubleRatchetService MAX_SKIP bound (FORWARD_SECRECY_DESIGN §3) so the
-     * on-disk store cannot be grown unboundedly by a malicious peer. Enforced in
-     * putSkippedMessageKey.
-     */
-    MAX_SKIPPED_KEYS_PER_CONVERSATION: 1000,
+    // skipped_message_keys store: the LIVE encrypt/decrypt path does NOT use a
+    // standalone per-(ratchetPub,msgNum) store — S6 persists skipped keys inside the
+    // ratchet_states blob (serializeRatchetState above). The dedicated store and its
+    // per-key helpers were dead on the live path, so they are REMOVED. The OBJECT
+    // STORE itself is RETAINED (not dropped) deliberately: (1) dropping an object
+    // store is a DB-schema change we are avoiding, and (2) the S7 device-pairing
+    // snapshot (exportRatchetSnapshot/importRatchetSnapshot) and clearAll() still
+    // read/write that store generically via _getAllRecords / a direct put, so it is
+    // not fully dead. A future migration may drop it once S7 also folds skipped keys
+    // into the ratchet_states snapshot.
 
     /**
      * Serialize a live DoubleRatchetService state object (Uint8Arrays + a DHs
@@ -1081,123 +1084,15 @@ const KeyStorageService = {
         });
     },
 
-    // -------- Skipped message keys (bounded MKSKIPPED store) --------
-
-    /**
-     * Count persisted skipped keys for a conversation (for the MAX_SKIP bound).
-     * @private
-     */
-    _countSkippedMessageKeys(conversationId) {
-        return new Promise((resolve, reject) => {
-            const tx = this.db.transaction('skipped_message_keys', 'readonly');
-            const index = tx.objectStore('skipped_message_keys').index('conversationId');
-            const request = index.count(IDBKeyRange.only(String(conversationId)));
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
-        });
-    },
-
-    /**
-     * Persist a single skipped/out-of-order message key, wrapped at rest.
-     * Enforces a MAX_SKIPPED_KEYS_PER_CONVERSATION bound (fail closed): if the
-     * conversation is already at the cap and this (ratchetPub,msgNum) is new, the
-     * write is REFUSED with a typed error rather than silently overwriting — the
-     * caller (S6) decides how to surface it, mirroring the ratchet's MAX_SKIP throw.
-     *
-     * @param {number|string} conversationId
-     * @param {string} ratchetPub - base64 sender ratchet public key (header.dh)
-     * @param {number} msgNum - message number within that chain (header.n)
-     * @param {Uint8Array} messageKey - the 32-byte skipped message key
-     */
-    async putSkippedMessageKey(conversationId, ratchetPub, msgNum, messageKey) {
-        this._ensureInitialized();
-
-        const convId = String(conversationId);
-        const msgN = msgNum | 0;
-
-        const existing = await new Promise((resolve, reject) => {
-            const tx = this.db.transaction('skipped_message_keys', 'readonly');
-            const store = tx.objectStore('skipped_message_keys');
-            const request = store.get([convId, ratchetPub, msgN]);
-            request.onsuccess = () => resolve(request.result || null);
-            request.onerror = () => reject(request.error);
-        });
-
-        if (!existing) {
-            const count = await this._countSkippedMessageKeys(convId);
-            if (count >= this.MAX_SKIPPED_KEYS_PER_CONVERSATION) {
-                const err = new Error(
-                    `[KeyStorageService] Skipped-key bound exceeded for conversation (max ${this.MAX_SKIPPED_KEYS_PER_CONVERSATION})`
-                );
-                err.code = 'MAX_SKIP_EXCEEDED';
-                throw err;
-            }
-        }
-
-        const { wrapped, iv } = await this._wrapSecret(messageKey);
-        const record = {
-            conversationId: convId,
-            ratchetPub,
-            msgNum: msgN,
-            wrappedKey: wrapped,
-            wrapIv: iv,
-            createdAt: new Date().toISOString()
-        };
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db.transaction('skipped_message_keys', 'readwrite');
-            const store = tx.objectStore('skipped_message_keys');
-            const request = store.put(record);
-            request.onsuccess = () => resolve();
-            request.onerror = () => {
-                console.error('[KeyStorageService] Failed to put skipped message key:', request.error);
-                reject(request.error);
-            };
-        });
-    },
-
-    /**
-     * Load + unwrap a single skipped message key.
-     * @param {number|string} conversationId
-     * @param {string} ratchetPub - base64 sender ratchet public key
-     * @param {number} msgNum
-     * @returns {Promise<Uint8Array|null>} the 32-byte message key, or null
-     */
-    async getSkippedMessageKey(conversationId, ratchetPub, msgNum) {
-        this._ensureInitialized();
-
-        const record = await new Promise((resolve, reject) => {
-            const tx = this.db.transaction('skipped_message_keys', 'readonly');
-            const store = tx.objectStore('skipped_message_keys');
-            const request = store.get([String(conversationId), ratchetPub, msgNum | 0]);
-            request.onsuccess = () => resolve(request.result || null);
-            request.onerror = () => reject(request.error);
-        });
-
-        if (!record || !record.wrappedKey || !record.wrapIv) {
-            return null;
-        }
-        return await this._unwrapSecret(record.wrappedKey, record.wrapIv);
-    },
-
-    /**
-     * Delete a single skipped message key (consume-once: after the out-of-order
-     * message arrives and is decrypted, its key is removed).
-     * @param {number|string} conversationId
-     * @param {string} ratchetPub
-     * @param {number} msgNum
-     */
-    async deleteSkippedMessageKey(conversationId, ratchetPub, msgNum) {
-        this._ensureInitialized();
-
-        return new Promise((resolve, reject) => {
-            const tx = this.db.transaction('skipped_message_keys', 'readwrite');
-            const store = tx.objectStore('skipped_message_keys');
-            const request = store.delete([String(conversationId), ratchetPub, msgNum | 0]);
-            request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error);
-        });
-    },
+    // -------- Skipped message keys --------
+    //
+    // The per-(ratchetPub,msgNum) helper methods (put/get/delete/count) that once
+    // wrote a standalone skipped_message_keys store were REMOVED: the live ratchet
+    // path persists skipped keys INSIDE the ratchet_states blob (serializeRatchetState)
+    // and bounds their TOTAL via DoubleRatchetService.MAX_SKIPPED_TOTAL. The
+    // skipped_message_keys OBJECT STORE is still created (schema unchanged) and is
+    // read/written generically by the S7 pairing snapshot + clearAll(); see the note
+    // above the Ratchet State Persistence section for why it is retained.
 
     // -------- Decrypted-message-key archive (§5, the load-bearing piece) --------
 
@@ -1363,6 +1258,40 @@ const KeyStorageService = {
         const rows = await this._getPrekeySecretsByKind(userId, 'spk');
         if (!rows.length) return null;
         return rows.reduce((max, r) => (r.keyId > max ? r.keyId : max), rows[0].keyId);
+    },
+
+    /**
+     * Metadata for every locally-stored signed prekey secret (NOT the secret bytes):
+     * { keyId, createdAt }. Sorted NEWEST-first by createdAt (ties broken by keyId,
+     * which is a Date.now()-derived monotonic id). Drives age-based SPK rotation +
+     * grace-window pruning in keyManagementService.publishPrekeys (P2-1). Does NOT
+     * unwrap any secret — only reads the plaintext bookkeeping fields.
+     * @param {string} userId
+     * @returns {Promise<Array<{keyId:number, createdAt:string}>>}
+     */
+    async getSignedPrekeyMeta(userId) {
+        this._ensureInitialized();
+        const rows = await this._getPrekeySecretsByKind(userId, 'spk');
+        return rows
+            .map(r => ({ keyId: r.keyId | 0, createdAt: r.createdAt || null }))
+            .sort((a, b) => {
+                const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
+                const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
+                if (tb !== ta) return tb - ta;       // newest createdAt first
+                return b.keyId - a.keyId;            // tie-break: highest id first
+            });
+    },
+
+    /** Delete a signed-prekey secret by spkId (grace-window pruning, P2-1). */
+    async deleteSignedPrekey(userId, spkId) {
+        this._ensureInitialized();
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('prekey_secrets', 'readwrite');
+            const store = tx.objectStore('prekey_secrets');
+            const request = store.delete([userId, 'spk', spkId | 0]);
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
     },
 
     /** Persist a one-time-prekey secret keyed by keyId. */
