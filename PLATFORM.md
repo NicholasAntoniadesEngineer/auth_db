@@ -10,6 +10,14 @@
 
 Neither Signal (no money) nor Mint/YNAB/Copilot (no privacy — they aggregate and monetize your financial data) nor any messenger can offer this. The defensible asset is **one E2E identity** (`auth_db/encryption`) that spans both products, with the messenger embedded inside the budget app and shipped as an all-in-one installer. The mandate of this document: make that claim *literally true in the code* before it is ever marketed.
 
+### 1.1 LAW — privacy is the paid product (non-negotiable)
+
+> **We stay in "Camp 1" — privacy-as-a-paid-product — permanently. We NEVER monetize user data: no ads, no data sale, no aggregation, no lead-gen, no "free in exchange for your data."** This is not a strategy choice; it's enforced by the architecture — we cannot read budgets or messages, so the Mint/Credit-Karma model is *impossible by design*. Any proposal that requires reading user data to make money is out of scope, full stop.
+>
+> **Revenue is always a free tier + paid tier(s)** (Proton-style freemium): single-app basics free, the combined / cross-app / sharing experience behind Premium.
+>
+> **Payments are a swappable adapter, not a dependency.** Stripe is the *current* rail only — it's notorious for withholding/freezing business funds, so the entitlement core (the `subscriptions` table + the server-authoritative `start_trial`/`downgrade_to_free` RPCs) is deliberately **provider-agnostic**, and the Stripe-specific edge functions are an adapter behind it. We must be able to add an alternate processor — or **crypto payments** — later as a new adapter that writes the same entitlement state, with **no change to entitlement, RLS, or the client**. Never let a payment provider become load-bearing in the entitlement logic.
+
 ---
 
 ## 2. ARCHITECTURE
@@ -124,7 +132,8 @@ Ordered. Each tagged **[foundational] / [high] / [medium]** with a one-line why.
 - **Bump #10 (minimize metadata) toward HIGH for positioning** — World App now beats us on metadata and is the direct combined competitor; add a competitive-watch note (World / Proton / Budgero / XChat).
 - **NEW trust table-stakes — open-source the crypto + publish a security writeup.** Signal/Matrix/Session publish specs; to beat Budgero on credibility we must be auditable, not just claim it.
 - **UX north-star templates are now concrete benchmarks** for #4/#7: Signal's QR-link + fail-closed key-change banner + World's color-coded verified/unverified bubbles (in-thread trust); Proton's invisible-automatic-encryption + single-login + 30-day reward checklist (replaces the blocking recovery-key wall).
-- **Monetization is decided:** Proton-style freemium (single-app free, combined/sharing behind Premium) — we cannot use the data-monetization model by design. Rails exist (Stripe + server-authoritative entitlement).
+- **Monetization is decided (LAW §1.1):** Proton-style freemium (free tier + paid tier(s); combined/sharing behind Premium) — data-monetization is impossible by design. Rails exist (Stripe + server-authoritative entitlement).
+- **NEW item — payment-provider adapter boundary.** *Why: Stripe withholds/freezes business funds; we must be able to swap processors or add crypto later without touching entitlement.* Formalize a single internal "payment confirmed → set entitlement" path so the `subscriptions` table + `start_trial`/`downgrade_to_free` RPCs stay provider-agnostic and each provider (Stripe today; an alternate processor or crypto tomorrow) is an additive adapter (its own checkout + webhook edge fn writing the same entitlement state). Keep all Stripe specifics out of the client and the entitlement RPCs. [high — strategic insurance, low effort now while there's only one provider]
 
 ### THE #1 THING — do this first, above everything
 
