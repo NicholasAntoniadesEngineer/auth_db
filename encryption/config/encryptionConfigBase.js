@@ -22,7 +22,7 @@ const EncryptionConfigBase = {
          * Must provide:
          * - querySelect(table, options)
          * - queryInsert(table, data)
-         * - queryUpdate(table, id, data)
+         * - queryUpdate(table, id, updateData, filter)
          * - queryUpsert(table, data, options)
          * - queryDelete(table, options)
          */
@@ -135,6 +135,28 @@ const EncryptionConfigBase = {
     },
 
     /**
+     * Key Rotation Configuration
+     * Controls automatic identity-key rotation. When `enabled` is not false,
+     * rotation is considered active (see getRotationStatus / initializeForUser).
+     */
+    keyRotation: {
+        /**
+         * Whether automatic key rotation is enabled
+         */
+        enabled: true,
+
+        /**
+         * Whether to check (and possibly rotate) on user initialization
+         */
+        checkOnInit: true,
+
+        /**
+         * Rotation interval in milliseconds (default: 24 hours)
+         */
+        intervalMs: 86400000
+    },
+
+    /**
      * Logging Configuration
      */
     logging: {
@@ -239,6 +261,7 @@ const EncryptionConfigBase = {
         merged.tables = { ...this.tables };
         merged.features = { ...this.features };
         merged.application = { ...this.application };
+        merged.keyRotation = { ...this.keyRotation };
         merged.logging = { ...this.logging };
 
         // Merge config properties
@@ -273,6 +296,10 @@ const EncryptionConfigBase = {
 
         if (config.application) {
             merged.application = { ...merged.application, ...config.application };
+        }
+
+        if (config.keyRotation) {
+            merged.keyRotation = { ...merged.keyRotation, ...config.keyRotation };
         }
 
         if (config.logging) {

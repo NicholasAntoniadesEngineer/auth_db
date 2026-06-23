@@ -623,13 +623,17 @@ const KeyManagementService = {
             if (this._database) {
                 const identityTable = this._config?.tables?.identityKeys || 'identity_keys';
 
-                await this._database.queryUpdate(identityTable, {
+                const result = await this._database.queryUpdate(identityTable, null, {
                     public_key: newPublicKeyB64,
                     current_epoch: newEpoch,
                     updated_at: new Date().toISOString()
                 }, {
                     user_id: this.currentUserId
                 });
+
+                if (result && result.error) {
+                    throw new Error(`queryUpdate failed: ${result.error.message}`);
+                }
             }
 
             // Store new key in history

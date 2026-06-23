@@ -411,7 +411,7 @@ const KeyBackupService = {
 
         // Update the backup
         try {
-            await this._database.queryUpdate(this._getBackupTableName(), {
+            const result = await this._database.queryUpdate(this._getBackupTableName(), null, {
                 session_backup_key_encrypted: sessionKeyEncrypted.encryptedData,
                 session_backup_key_salt: sessionKeyEncrypted.salt,
                 session_backup_key_iv: sessionKeyEncrypted.iv,
@@ -419,6 +419,10 @@ const KeyBackupService = {
             }, {
                 user_id: userId
             });
+
+            if (result && result.error) {
+                throw new Error(`queryUpdate failed: ${result.error.message}`);
+            }
 
             console.log('[KeyBackupService] Session backup key added to existing backup');
             return sessionBackupKey;
@@ -574,7 +578,7 @@ const KeyBackupService = {
         }
 
         try {
-            await this._database.queryUpdate(this._getSessionTableName(), {
+            const result = await this._database.queryUpdate(this._getSessionTableName(), null, {
                 message_counter: counter,
                 updated_at: new Date().toISOString()
             }, {
@@ -582,8 +586,13 @@ const KeyBackupService = {
                 conversation_id: conversationId,
                 key_epoch: epoch
             });
+
+            if (result && result.error) {
+                throw new Error(`queryUpdate failed: ${result.error.message}`);
+            }
         } catch (error) {
-            console.warn('[KeyBackupService] Failed to update session counter:', error);
+            console.error('[KeyBackupService] Failed to update session counter:', error);
+            throw error;
         }
     },
 

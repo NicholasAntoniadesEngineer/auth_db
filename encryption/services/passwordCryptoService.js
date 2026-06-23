@@ -322,7 +322,18 @@ const PasswordCryptoService = {
      * @returns {string}
      */
     _arrayToBase64(array) {
-        return btoa(String.fromCharCode.apply(null, array));
+        // Build the binary string in chunks. Calling
+        // String.fromCharCode.apply(null, array) in one shot throws a RangeError
+        // on large buffers (too many function arguments), so process a fixed-size
+        // window at a time. The resulting string is byte-for-byte identical to the
+        // single-call form, so btoa() produces the same Base64 as before.
+        const CHUNK_SIZE = 8192; // 8KB per chunk
+        let binary = '';
+        for (let i = 0; i < array.length; i += CHUNK_SIZE) {
+            const chunk = array.subarray(i, i + CHUNK_SIZE);
+            binary += String.fromCharCode.apply(null, chunk);
+        }
+        return btoa(binary);
     },
 
     /**
