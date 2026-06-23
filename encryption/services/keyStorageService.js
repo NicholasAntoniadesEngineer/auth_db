@@ -965,7 +965,10 @@ const KeyStorageService = {
             Ns: state.Ns | 0,
             Nr: state.Nr | 0,
             PN: state.PN | 0,
-            MKSKIPPED: skipped
+            MKSKIPPED: skipped,
+            // W3-2: invariant attachment root (null on pre-W3-2 states). Persisted so
+            // the ratchet-invariant attachment KEK survives reloads and ratchet steps.
+            AK0: ser(state.AK0)
         };
     },
 
@@ -998,7 +1001,9 @@ const KeyStorageService = {
             Ns: obj.Ns | 0,
             Nr: obj.Nr | 0,
             PN: obj.PN | 0,
-            MKSKIPPED
+            MKSKIPPED,
+            // W3-2: invariant attachment root (null on pre-W3-2 serialized states).
+            AK0: de(obj.AK0)
         };
     },
 

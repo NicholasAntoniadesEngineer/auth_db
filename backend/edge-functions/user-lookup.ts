@@ -99,7 +99,9 @@ serve(async (req) => {
     // Route to appropriate handler
     switch (action) {
       case 'findByEmail':
-        return await handleFindByEmail(supabaseAdmin, email)
+        // W3-3: pass the JWT-verified caller id so the resolver can rate-limit
+        // per-caller. The lookup itself is a targeted, paginated-safe DB query.
+        return await handleFindByEmail(supabaseAdmin, email, authData.user.id)
 
       case 'getEmailById':
         return await handleGetEmailById(supabaseAdmin, userId)
@@ -127,9 +129,20 @@ serve(async (req) => {
 })
 
 /**
- * Find user ID by email address
+ * Find user ID by email address (W3-3 hardened).
+ *
+ * Old behaviour was an unthrottled account-existence oracle that also paged the
+ * WHOLE user table (auth.admin.listUsers() returns only the first ~50 users, so
+ * it silently missed users past page 1). This version:
+ *   - resolves via the SECURITY DEFINER `resolve_user_id_by_email` RPC, a single
+ *     INDEXED query against auth.users (paginated-safe at any scale, no full read);
+ *   - rate-limits per caller inside that RPC (the caller id from the verified JWT
+ *     is passed in; the RPC counts hits AND misses);
+ *   - returns a UNIFORM 200 shape `{ userId: <id|null> }` for both found and
+ *     not-found, so the response status no longer doubles as a membership oracle.
+ *     A genuine caller still gets the userId it needs to start a conversation/share.
  */
-async function handleFindByEmail(supabaseAdmin: any, email: string) {
+async function handleFindByEmail(supabaseAdmin: any, email: string, callerId: string) {
   if (!email) {
     return new Response(
       JSON.stringify({ error: 'Email is required' }),
@@ -140,11 +153,14 @@ async function handleFindByEmail(supabaseAdmin: any, email: string) {
     )
   }
 
-  // Look up user by email using admin client
-  const { data, error } = await supabaseAdmin.auth.admin.listUsers()
+  // Targeted, rate-limited resolution. The RPC is granted to service_role only.
+  const { data, error } = await supabaseAdmin.rpc('resolve_user_id_by_email', {
+    p_caller_id: callerId,
+    p_email: email,
+  })
 
   if (error) {
-    console.error('Error listing users:', error)
+    console.error('Error resolving user by email:', error)
     return new Response(
       JSON.stringify({ error: 'Failed to search for user' }),
       {
@@ -154,22 +170,37 @@ async function handleFindByEmail(supabaseAdmin: any, email: string) {
     )
   }
 
-  // Find user with matching email (case-insensitive)
-  const user = data.users.find((u: any) => u.email?.toLowerCase() === email.toLowerCase())
-
-  if (!user) {
+  // Rate limit exceeded -> 429 (do NOT leak existence either way).
+  if (data?.status === 'rate_limited') {
     return new Response(
-      JSON.stringify({ error: 'User not found' }),
+      JSON.stringify({ error: 'Too many lookups, please try again later' }),
       {
-        status: 404,
+        status: 429,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+          ...(data.retry_after_seconds ? { 'Retry-After': String(data.retry_after_seconds) } : {}),
+        }
+      }
+    )
+  }
+
+  if (data?.status === 'error') {
+    console.error('resolve_user_id_by_email error:', data.error)
+    return new Response(
+      JSON.stringify({ error: 'Failed to search for user' }),
+      {
+        status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       }
     )
   }
 
-  // Return user ID
+  // Uniform 200 for both found and not-found: { userId: <id|null> }. This blunts
+  // the 200-vs-404 existence oracle; the legitimate caller reads userId when set.
+  const resolvedId = data?.status === 'ok' ? data.user_id : null
   return new Response(
-    JSON.stringify({ userId: user.id }),
+    JSON.stringify({ userId: resolvedId }),
     {
       status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }

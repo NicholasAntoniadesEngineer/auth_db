@@ -1958,22 +1958,42 @@ const KeyManagementService = {
     },
 
     /**
-     * Get a stable per-conversation symmetric key for ATTACHMENT encryption.
-     * Used by AttachmentService.
+     * Get a per-conversation symmetric key for ATTACHMENT file-key wrapping.
+     * Used by AttachmentService (_encryptFileKey / _decryptFileKey).
      *
-     * The static-ECDH session_keys store is no longer populated (the Double Ratchet
-     * replaced it), so we derive a deterministic attachment key from the ratchet's
-     * shared ROOT key (RK) via HKDF. Both parties share RK after X3DH bootstrap, so
-     * both derive the SAME attachment key; it is bound to a fixed info string so it
-     * never collides with ratchet message keys. NOTE: this attachment key is stable
-     * for the life of the ratchet root (it does NOT per-attachment forward-secret —
-     * attachment FS is out of scope for S5/S6; tracked as future work), but it is
-     * still rooted in the X3DH/ratchet secret, not the long-term identity.
+     * W3-2 FIX — RATCHET-INVARIANT ROOT + CONTEXT BINDING:
+     * The attachment KEK MUST be derived from a secret that does NOT advance with the
+     * Double Ratchet. The previous implementation derived it from the live root key
+     * `state.RK`, which rotates on every DH-ratchet step — so an attachment wrapped
+     * before a step became permanently undecryptable (a peer could force this with a
+     * single message). We now derive from `state.AK0`, the INVARIANT attachment root
+     * minted once at X3DH bootstrap from the shared secret SK (see
+     * DoubleRatchetService.ratchetInit*). Both parties feed the same SK in, so both
+     * derive the same AK0, and AK0 never changes for the life of the conversation ->
+     * encrypt-time and decrypt-time derivation are always over the same input.
+     *
+     * CONTEXT BINDING (AAD-equivalent): secretbox (XSalsa20-Poly1305) takes no AAD,
+     * so we bind context by folding it into the HKDF `info`. When `context` is given
+     * we mix the conversation id and a stable per-attachment identifier (the storage
+     * path — known at upload, persisted, and re-read at download) into the derived
+     * key, so a wrapped key cannot be lifted onto another row/conversation: a key
+     * wrapped for (convA, pathA) will not unwrap under (convA, pathB).
+     *
+     * BACK-COMPAT: existing attachments were wrapped under the legacy RK-based key
+     * with NO context. To keep them decryptable we fall back to the legacy derivation
+     * when AK0 is absent OR when no context is supplied (the legacy code path called
+     * getSessionKey(conversationId) with one argument). New writes always pass a
+     * context, so they get the invariant+bound key; reads of legacy rows that lack a
+     * context still resolve via the legacy path. See attachmentService for how the
+     * reader tries the bound key first and falls back to the legacy key.
      *
      * @param {number|string} conversationId - Conversation ID
+     * @param {{attachmentPath?: string}} [context] - optional context to bind
+     *        (attachmentPath = the storage_path of the attachment). When omitted,
+     *        the LEGACY (unbound, RK-rooted) key is returned for back-compat.
      * @returns {Promise<Uint8Array|null>} 32-byte attachment key or null
      */
-    async getSessionKey(conversationId) {
+    async getSessionKey(conversationId, context = null) {
         if (!this.initialized) {
             console.error('[KeyManagementService] getSessionKey: Service not initialized');
             return null;
@@ -1985,10 +2005,25 @@ const KeyManagementService = {
             return null;
         }
 
-        // Attachment key = HKDF(ikm=RK, info="MoneyTracker:Attachment:v1", salt=RK).
-        // Explicit non-empty salt bypasses the context-salt fallback deterministically.
+        // LEGACY PATH (back-compat): no context, or this session predates W3-2 and has
+        // no invariant AK0 -> reproduce the original RK-rooted derivation exactly so
+        // attachments wrapped under the old scheme stay decryptable. NOTE: this path
+        // remains ratchet-DEPENDENT by construction (that is the bug being retired for
+        // new uploads); it exists ONLY to read pre-W3-2 rows.
+        if (!context || !state.AK0) {
+            return await KeyDerivationService._hkdf(
+                state.RK, 'MoneyTracker:Attachment:v1', 32, state.RK
+            );
+        }
+
+        // W3-2 PATH: invariant root AK0 + bound context. The info string carries the
+        // domain tag, the conversation id, and the per-attachment storage path so the
+        // derived KEK is unique per (conversation, attachment) and cannot be reused on
+        // another row. AK0 is the explicit non-empty salt (bypasses the context-salt
+        // fallback deterministically). AK0 never advances -> derivation is invariant.
+        const info = `MoneyTracker:Attachment:v2|conv=${conversationId}|path=${context.attachmentPath || ''}`;
         return await KeyDerivationService._hkdf(
-            state.RK, 'MoneyTracker:Attachment:v1', 32, state.RK
+            state.AK0, info, 32, state.AK0
         );
     },
 

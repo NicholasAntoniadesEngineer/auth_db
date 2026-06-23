@@ -59,6 +59,21 @@
     const INFO_MK   = 'MoneyTracker:MK:v1';
     const INFO_CK   = 'MoneyTracker:CK:v1';
     const INFO_AEAD = 'MoneyTracker:MsgAEAD:v1';
+    // W3-2: the attachment KEK is rooted in the INVARIANT X3DH shared secret SK
+    // (NOT the advancing root key RK). Minted ONCE at session bootstrap and frozen
+    // into AK0; both parties feed the SAME SK into ratchetInit*, so both derive the
+    // SAME AK0 and it never changes across DH-ratchet steps -> an attachment wrapped
+    // before a ratchet step stays decryptable forever. Domain-separated from every
+    // message/chain key. See keyManagementService.getSessionKey / attachmentService.
+    const INFO_AK0  = 'MoneyTracker:AttachmentRoot:v1';
+
+    // W3-2: derive the invariant per-conversation attachment root from SK. Async
+    // because _hkdf is async. SK is the X3DH root shared secret (identical on both
+    // sides); we pass it as BOTH ikm and salt (mirrors getSessionKey's explicit-salt
+    // convention so the context-salt fallback is never hit and the result is stable).
+    async function deriveAttachmentRoot(SK) {
+        return await _kdf()._hkdf(SK, INFO_AK0, 32, SK);
+    }
 
     // ---- dependency resolution (browser globals or node require) ----------
     function _cp() {
@@ -195,6 +210,10 @@
             Nr: s.Nr | 0,
             PN: s.PN | 0,
             MKSKIPPED: new Map(),
+            // W3-2: AK0 is INVARIANT — carry it through every clone so the attachment
+            // root survives encrypt/decrypt and DH-ratchet steps unchanged. Null on
+            // pre-W3-2 (legacy) states that bootstrapped before this field existed.
+            AK0: s.AK0 ? Uint8Array.from(s.AK0) : null,
         };
         for (const [k, v] of s.MKSKIPPED) copy.MKSKIPPED.set(k, Uint8Array.from(v));
         return copy;
@@ -230,6 +249,8 @@
         const DHs = CP.generateKeyPair();
         const dhOut = CP.dhRaw(DHs.secretKey, DHr_bob);
         const { RK, CK } = await KDF_RK(SK, dhOut);
+        // W3-2: capture the invariant attachment root BEFORE RK advances.
+        const AK0 = await deriveAttachmentRoot(SK);
         return {
             RK: RK,
             CKs: CK,
@@ -238,6 +259,7 @@
             DHr: Uint8Array.from(DHr_bob),
             Ns: 0, Nr: 0, PN: 0,
             MKSKIPPED: new Map(),
+            AK0: AK0,
         };
     }
 
@@ -247,6 +269,8 @@
      * SK is the X3DH root.
      */
     async function ratchetInitBob(SK, DHs_bob) {
+        // W3-2: same invariant attachment root as Alice (same SK in -> same AK0 out).
+        const AK0 = await deriveAttachmentRoot(SK);
         return {
             RK: Uint8Array.from(SK),
             CKs: null,
@@ -255,6 +279,7 @@
             DHr: null,
             Ns: 0, Nr: 0, PN: 0,
             MKSKIPPED: new Map(),
+            AK0: AK0,
         };
     }
 
