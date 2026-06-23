@@ -43,7 +43,12 @@ const MoneyTrackerEncryptionConfig = EncryptionConfigBase.merge({
             historicalKeys: 'historical_keys',
             wrapKeys: 'wrap_keys',
             pinnedKeys: 'pinned_keys',
-            recvCounters: 'recv_counters'
+            recvCounters: 'recv_counters',
+            // S4 (forward secrecy): Double Ratchet persistence. ADDED in v2,
+            // never replaces the stores above (additive onupgradeneeded).
+            ratchetStates: 'ratchet_states',
+            skippedMessageKeys: 'skipped_message_keys',
+            decryptedMessageKeys: 'decrypted_message_keys'
         }
     },
 
