@@ -165,6 +165,50 @@ class WeakPasswordError extends EncryptionError {
 }
 
 /**
+ * Thrown when a peer's TOFU-pinned identity key (X25519 IK or Ed25519 IK_sig)
+ * has CHANGED from the value we previously pinned. This is FAIL-CLOSED: it must
+ * propagate so NO session key is derived and no message is sent/decrypted against
+ * the new key, until the user verifies the new identity (via the safety number)
+ * and explicitly accepts it (KeyManagementService.acceptPeerIdentityChange).
+ *
+ * A changed identity key is the classic active-MITM / hostile-server signal; the
+ * pin only provides enforcement if a change blocks rather than auto-adopts.
+ */
+class PeerIdentityChangedError extends EncryptionError {
+    /**
+     * @param {Object} details
+     * @param {string} details.userId          - Peer user id whose key changed
+     * @param {string} details.oldFingerprint  - Previously pinned fingerprint
+     * @param {string} details.newFingerprint  - Newly fetched (rejected) fingerprint
+     * @param {string} details.keyType         - 'identity' (X25519 IK) | 'sign' (Ed25519 IK_sig)
+     */
+    constructor(details = {}) {
+        const keyType = details.keyType || 'identity';
+        super(
+            `Peer identity key changed (${keyType}) - verify the safety number before continuing`,
+            'PEER_IDENTITY_CHANGED',
+            // Recoverable: the user can accept the change after verifying it.
+            true
+        );
+        this.name = 'PeerIdentityChangedError';
+        this.userId = details.userId || null;
+        this.oldFingerprint = details.oldFingerprint || null;
+        this.newFingerprint = details.newFingerprint || null;
+        this.keyType = keyType;
+    }
+
+    toJSON() {
+        return {
+            ...super.toJSON(),
+            userId: this.userId,
+            oldFingerprint: this.oldFingerprint,
+            newFingerprint: this.newFingerprint,
+            keyType: this.keyType
+        };
+    }
+}
+
+/**
  * Thrown when device pairing fails
  */
 class DevicePairingError extends EncryptionError {
@@ -191,6 +235,7 @@ const EncryptionErrors = {
     SessionKeyError,
     BackupRestoreError,
     WeakPasswordError,
+    PeerIdentityChangedError,
     DevicePairingError,
 
     /**
@@ -249,6 +294,7 @@ if (typeof window !== 'undefined') {
     window.SessionKeyError = SessionKeyError;
     window.BackupRestoreError = BackupRestoreError;
     window.WeakPasswordError = WeakPasswordError;
+    window.PeerIdentityChangedError = PeerIdentityChangedError;
     window.DevicePairingError = DevicePairingError;
 }
 

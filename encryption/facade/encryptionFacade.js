@@ -30,6 +30,16 @@ const EncryptionFacade = {
     _keysExist: false,
 
     /**
+     * P0-5: per-conversation stash of the sender-side per-message key from the LAST
+     * encryptMessage call, kept INSIDE the facade so the raw 32-byte key is NEVER
+     * surfaced on the public return object (it must not spread into messaging-layer
+     * objects). Consumed once by archivePendingSentKey() after the DB insert returns
+     * the message id (§5). { [conversationId]: Uint8Array }
+     * @private
+     */
+    _pendingSentKeys: {},
+
+    /**
      * Initialize the encryption facade
      * @param {Object} config - Encryption config object
      * @param {string} userId - User ID
@@ -131,7 +141,10 @@ const EncryptionFacade = {
      * @param {number|string} conversationId - Conversation ID
      * @param {string} plaintext - Message to encrypt
      * @param {string} recipientId - Recipient's user ID
-     * @returns {Promise<Object>} { ciphertext, nonce, counter, epoch, isEncrypted: true }
+     * @returns {Promise<Object>} { ciphertext, nonce, header, x3dhPreamble?, counter, epoch, isEncrypted: true }
+     *          NOTE: the raw per-message key is deliberately NOT included (P0-5).
+     *          After the DB insert, call archivePendingSentKey(conversationId, id)
+     *          to archive the sender-side key for own-history re-render (§5).
      */
     async encryptMessage(conversationId, plaintext, recipientId) {
         if (!this.initialized || !this._keysExist) {
@@ -144,8 +157,16 @@ const EncryptionFacade = {
         // Encrypt
         const encrypted = await KeyManagementService.encryptMessage(conversationId, plaintext);
 
+        // P0-5: keep the raw 32-byte per-message key INSIDE the facade — stash it for
+        // archivePendingSentKey() and strip it from the public return object so it
+        // never spreads into messaging-layer objects.
+        const { _messageKey, ...publicResult } = encrypted;
+        if (_messageKey) {
+            this._pendingSentKeys[String(conversationId)] = _messageKey;
+        }
+
         return {
-            ...encrypted,
+            ...publicResult,
             isEncrypted: true
         };
     },
@@ -195,6 +216,27 @@ const EncryptionFacade = {
     },
 
     /**
+     * P0-5: archive the sender-side per-message key stashed by the last
+     * encryptMessage(conversationId) call, now that the DB insert has returned the
+     * message id (§5). The raw key never left the facade. Consumes (clears) the
+     * stash. No-op if nothing is stashed (e.g. a legacy/no-key send).
+     * @param {number|string} conversationId
+     * @param {number|string} messageId
+     * @returns {Promise<boolean>} true if a key was archived
+     */
+    async archivePendingSentKey(conversationId, messageId) {
+        if (!this.initialized || !this._keysExist) {
+            throw new Error('[EncryptionFacade] Encryption not set up');
+        }
+        const key = String(conversationId);
+        const mk = this._pendingSentKeys[key];
+        if (!mk) return false;
+        delete this._pendingSentKeys[key];
+        await KeyManagementService.archiveSentMessageKey(conversationId, messageId, mk);
+        return true;
+    },
+
+    /**
      * Get safety number for verification
      * @param {string} otherUserId - Other user's ID
      * @returns {Promise<string>} Formatted safety number
@@ -205,6 +247,22 @@ const EncryptionFacade = {
         }
 
         return await KeyManagementService.getSafetyNumber(otherUserId);
+    },
+
+    /**
+     * Adopt a CHANGED peer identity after the user has verified it out-of-band
+     * (compared the safety number). Re-pins the peer's new X25519 IK + Ed25519
+     * IK_sig, clearing the fail-closed PeerIdentityChangedError block so the next
+     * send/decrypt proceeds. MUST be gated behind explicit user verification — never
+     * call this automatically on a change notice. (P0-1/P0-2 accept path.)
+     * @param {string} otherUserId - Peer whose identity change the user accepts
+     * @returns {Promise<{accepted:boolean, identityFingerprint?:string, signFingerprint?:string}>}
+     */
+    async acceptPeerIdentityChange(otherUserId) {
+        if (!this.initialized || !this._keysExist) {
+            throw new Error('[EncryptionFacade] Encryption not set up');
+        }
+        return await KeyManagementService.acceptPeerIdentityChange(otherUserId);
     },
 
     /**

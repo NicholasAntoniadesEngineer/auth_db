@@ -162,6 +162,11 @@
      *          oneTimePrekeyPub?:  Uint8Array(32)  // OPK_b public (optional)
      *          oneTimePrekeyId?:   number          // OPK id (optional, passed through)
      *        }
+     * @param {Uint8Array} [args.trustedIdentitySignPub]  Ed25519 IK_sig to verify the
+     *        SPK signature against. When the caller has a TOFU-pinned IK_sig, it
+     *        passes the PINNED value here so a swapped-and-re-signed bundle is
+     *        rejected (fail closed). Omitted on first contact -> falls back to the
+     *        bundle's own identitySignPub (TOFU).
      * @returns {Promise<{ SK, preamble, ephemeralKeyPair, associatedData }>}
      *   - SK              : 32-byte shared secret (feed to ratchetInitAlice)
      *   - preamble        : the bytes Bob needs (all base64 via serializeKey),
@@ -178,8 +183,14 @@
         }
         if (!b) throw new Error('[X3DHService] deriveInitiatorRoot: missing peerBundle');
 
-        // 1) Verify Bob's SPK signature BEFORE any DH (fail closed).
-        verifySignedPrekey(b.signedPrekeyPub, b.signedPrekeySig, b.identitySignPub);
+        // 1) Verify Bob's SPK signature BEFORE any DH (fail closed). Bind the check
+        //    to the caller's TRUSTED (TOFU-pinned) IK_sig when provided; otherwise
+        //    fall back to the bundle's own IK_sig (first-contact TOFU). Verifying
+        //    against a pinned key means a swapped-then-re-signed bundle is rejected.
+        const trustedSignPub = (args.trustedIdentitySignPub instanceof Uint8Array)
+            ? args.trustedIdentitySignPub
+            : b.identitySignPub;
+        verifySignedPrekey(b.signedPrekeyPub, b.signedPrekeySig, trustedSignPub);
 
         // 2) Fresh ephemeral EK_a (deterministic under an injected RNG in tests).
         const EK = CP.generateKeyPair();

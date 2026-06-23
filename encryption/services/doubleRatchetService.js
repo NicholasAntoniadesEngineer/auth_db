@@ -131,8 +131,23 @@
     // parameter. Folding into the salt authenticates the header just as well as
     // folding into info: any tamper changes encKey, so secretbox.open fails.
     async function deriveAeadKey(MK, header, adBytes) {
+        // P0-3 (b): the header is authenticated ONLY because its serialized bytes are
+        // folded into the HKDF salt. keyDerivationService._hkdf SILENTLY substitutes
+        // a context salt (derived from INFO_AEAD alone) when given an empty/0-length
+        // salt -- which would un-authenticate the header (every header -> same key).
+        // Guard against that: require a real 32-byte ratchet pub and a non-empty
+        // serialized header salt, so the empty-salt fallback can never be reached.
+        if (!header || !(header.dh instanceof Uint8Array) || header.dh.length !== 32) {
+            throw new Error('[DoubleRatchetService] deriveAeadKey: header.dh must be a 32-byte ratchet public key (header binding integrity)');
+        }
         let saltBytes = serializeHeaderBytes(header);
         if (adBytes && adBytes.length) saltBytes = concatBytes(saltBytes, adBytes);
+        if (!saltBytes || saltBytes.length === 0) {
+            // Defensive: serializeHeaderBytes is fixed 40 bytes, but never let an
+            // empty salt reach _hkdf (it would trigger the context-salt fallback and
+            // strip header authentication).
+            throw new Error('[DoubleRatchetService] deriveAeadKey: empty header/salt bytes would un-authenticate the header');
+        }
         return await _kdf()._hkdf(MK, INFO_AEAD, 32, saltBytes);
     }
 

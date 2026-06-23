@@ -1047,15 +1047,34 @@ const KeyManagementService = {
         // ---------- INITIATOR (Alice) ----------
         console.log(`[KeyManagementService] establishSession: INITIATOR bootstrap conv=${conversationId}`);
 
+        // _claimPeerBundle resolves the peer's X25519 IK through _getPinnedPeerKey,
+        // which THROWS PeerIdentityChangedError fail-closed if the pinned X25519 IK
+        // changed (P0-2) — so a swapped identity key aborts here before any SK.
         const peerBundle = await this._claimPeerBundle(otherUserId);
 
-        // TOFU-pin the peer's Ed25519 signing key BEFORE we trust its SPK signature.
+        // P0-1 (fail-closed) + ORDERING: resolve the TRUSTED Ed25519 IK_sig BEFORE
+        // verifying the SPK signature, and reject a CHANGED pinned IK_sig up front
+        // with the typed PeerIdentityChangedError. _pinPeerSignKey:
+        //   - first contact -> pins the bundle's IK_sig (TOFU); we then verify the
+        //     SPK against that freshly-pinned key.
+        //   - unchanged -> no-op.
+        //   - CHANGED -> THROWS PeerIdentityChangedError (no SK, no re-pin).
+        // This never trusts/re-pins a changed key before verification — a change
+        // throws; only first-contact pins, and the SPK is then verified against the
+        // PINNED IK_sig (so a swapped-then-re-signed bundle is rejected as a changed
+        // identity, not silently adopted).
         await this._pinPeerSignKey(otherUserId, peerBundle._identitySignPubB64);
 
-        // deriveInitiatorRoot verifies the SPK signature FIRST (fail closed).
+        const signPinId = this._signPinId(otherUserId);
+        const pinnedSign = await KeyStorageService.getPinnedKey(signPinId);
+        const trustedSignPubB64 = pinnedSign ? pinnedSign.publicKey : peerBundle._identitySignPubB64;
+
+        // deriveInitiatorRoot verifies the SPK signature FIRST (fail closed), bound
+        // to the PINNED IK_sig (never the raw bundle value once a pin exists).
         const init = await X3DHService.deriveInitiatorRoot({
             identityKeyPair: ourKeys,
-            peerBundle
+            peerBundle,
+            trustedIdentitySignPub: CryptoPrimitivesService.deserializeKey(trustedSignPubB64)
         });
 
         const state = await DoubleRatchetService.ratchetInitAlice(init.SK, peerBundle.signedPrekeyPub);
@@ -1085,26 +1104,47 @@ const KeyManagementService = {
     },
 
     /**
-     * Pin (TOFU) a peer's Ed25519 IK_sig signing key. First contact pins; a later
-     * change dispatches a one-shot `peerSignKeyChanged` warning (do NOT block) and
-     * re-pins, mirroring the X25519 _getPinnedPeerKey policy. The pinned key is
-     * stored under a "sign:" namespaced userId in the existing pinned_keys store.
+     * Namespaced pinned_keys id for a peer's Ed25519 IK_sig signing key (kept
+     * distinct from the X25519 identity pin, which uses the bare userId).
      * @private
+     */
+    _signPinId(otherUserId) { return 'sign:' + otherUserId; },
+
+    /**
+     * Pin (TOFU) a peer's Ed25519 IK_sig signing key — FAIL CLOSED (P0-1, roadmap #4).
+     *
+     *  - First contact (no existing pin): pin it (TOFU). No change event.
+     *  - Unchanged key: no-op.
+     *  - CHANGED key: do NOT auto-adopt/re-pin. THROW PeerIdentityChangedError so
+     *    establishSession aborts before any SK is derived. Legitimate rotation /
+     *    re-pair is adopted only via acceptPeerIdentityChange() after the user
+     *    verifies the safety number.
+     *
+     * (A genuinely paired device presents the SAME IK_sig — it is HKDF-derived from
+     * the shared X25519 identity — so pairing does NOT trip this. SPK rotation does
+     * not change IK_sig either.)
+     *
+     * @private
+     * @throws {PeerIdentityChangedError} when the pinned IK_sig has changed
      */
     async _pinPeerSignKey(otherUserId, signPubB64) {
         if (!signPubB64) return;
-        const pinId = 'sign:' + otherUserId;
+        const pinId = this._signPinId(otherUserId);
         const fp = CryptoPrimitivesService.getKeyFingerprint(
             CryptoPrimitivesService.deserializeKey(signPubB64)
         );
         const pinned = await KeyStorageService.getPinnedKey(pinId);
         if (!pinned) {
+            // First contact - trust on first use.
             await KeyStorageService.pinKey(pinId, signPubB64, fp);
             return;
         }
         if (pinned.publicKey === signPubB64) {
+            // Unchanged - normal case.
             return;
         }
+        // CHANGED: fail closed. Warn once (for any UI listener), then THROW so no
+        // session is derived against the new signing key.
         if (pinned.lastWarnedFingerprint !== fp) {
             if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
                 window.dispatchEvent(new CustomEvent('peerSignKeyChanged', {
@@ -1113,7 +1153,12 @@ const KeyManagementService = {
             }
             await KeyStorageService.updatePinnedWarn(pinId, fp);
         }
-        await KeyStorageService.pinKey(pinId, signPubB64, fp);
+        throw this._peerIdentityChangedError({
+            userId: otherUserId,
+            oldFingerprint: pinned.fingerprint,
+            newFingerprint: fp,
+            keyType: 'sign'
+        });
     },
 
     /**
@@ -1230,6 +1275,30 @@ const KeyManagementService = {
     },
 
     /**
+     * Build a typed PeerIdentityChangedError (FAIL-CLOSED on a TOFU pin change).
+     * Falls back to a plain Error carrying the same fields + a `code` so callers
+     * that match on `err.code === 'PEER_IDENTITY_CHANGED'` still work if the typed
+     * class is unavailable.
+     * @private
+     * @param {{userId:string, oldFingerprint:string, newFingerprint:string, keyType:string}} details
+     * @returns {Error}
+     */
+    _peerIdentityChangedError(details) {
+        const Cls = (typeof PeerIdentityChangedError !== 'undefined')
+            ? PeerIdentityChangedError
+            : (typeof window !== 'undefined' && window.PeerIdentityChangedError) || null;
+        if (Cls) return new Cls(details);
+        const e = new Error(`Peer identity key changed (${details.keyType})`);
+        e.name = 'PeerIdentityChangedError';
+        e.code = 'PEER_IDENTITY_CHANGED';
+        e.userId = details.userId;
+        e.oldFingerprint = details.oldFingerprint;
+        e.newFingerprint = details.newFingerprint;
+        e.keyType = details.keyType;
+        return e;
+    },
+
+    /**
      * Sentinel rendered for a pre-cutover (static-ECDH) message that carries no
      * ratchet header. Clean break (FORWARD_SECRECY_DESIGN §7): such rows are
      * UNAVAILABLE, not an error.
@@ -1318,7 +1387,6 @@ const KeyManagementService = {
 
         // Responder bootstrap on the FIRST inbound message carrying an X3DH preamble.
         let state = await KeyStorageService.getRatchetState(conversationId);
-        let responderAD = null;
         if (!state) {
             if (!x3dhPreamble) {
                 // No ratchet and no bootstrap header — cannot establish a session.
@@ -1326,14 +1394,22 @@ const KeyManagementService = {
             }
             await this.establishSession(conversationId, otherUserId, x3dhPreamble);
             state = await KeyStorageService.getRatchetState(conversationId);
-            responderAD = this._pendingResponderAD && this._pendingResponderAD[String(conversationId)];
         }
 
         // AD for the first inbound (bootstrap) message: bind IK_a||IK_b exactly as
         // the initiator did. For all later messages AD is undefined.
+        //
+        // P0-4 (reload-safe): RECOMPUTE the AD DETERMINISTICALLY from the persisted
+        // X3DH preamble + our own (responder) identity via _reconstructAD — the SAME
+        // method the archive-hit path uses — instead of reading the in-memory
+        // _pendingResponderAD field. The in-memory field is lost on a reload that
+        // happens after the responder ratchet was persisted but before msg0 was
+        // archived; reading it then would leave AD undefined and make msg0
+        // permanently undecryptable on the batch path. _reconstructAD needs nothing
+        // beyond the preamble's ikPub and our local identity, both persisted.
         let adBytes;
         if (x3dhPreamble) {
-            adBytes = responderAD || (this._pendingResponderAD && this._pendingResponderAD[String(conversationId)]);
+            adBytes = await this._reconstructAD(x3dhPreamble, senderId, recipientId);
         }
 
         const wireHeader = {
@@ -1454,20 +1530,23 @@ const KeyManagementService = {
     },
 
     /**
-     * SM-01: Fetch a peer's current public key through a TOFU (trust-on-first-use)
-     * pin. This is the single chokepoint both ECDH derivation sites use instead of
-     * calling HistoricalKeysService.getCurrentKey directly.
+     * SM-01: Fetch a peer's current X25519 identity public key through a TOFU
+     * (trust-on-first-use) pin. Single chokepoint both ECDH/X3DH sites use instead
+     * of calling HistoricalKeysService.getCurrentKey directly.
      *
-     * Policy (non-blocking, smooth-UX):
-     *  - First contact: pin the fetched key, return it.
-     *  - Unchanged key (common case): return it verbatim - byte-identical to today.
-     *  - Changed key: dispatch a one-shot `peerKeyChanged` event (warn, do NOT
-     *    block), then adopt + re-pin the new key so the conversation keeps working.
-     *    We only warn once per distinct new fingerprint.
+     * Policy — FAIL CLOSED (P0-2, roadmap #4):
+     *  - First contact: pin the fetched key, return it (TOFU).
+     *  - Unchanged key (common case): return it verbatim — byte-identical to today.
+     *  - CHANGED key: do NOT auto-adopt/re-pin. THROW PeerIdentityChangedError so
+     *    establishSession aborts and NO SK is derived against the new key. A change
+     *    is the active-MITM / hostile-server signal; the pin only enforces if it
+     *    blocks. Legitimate rotation / re-pair is adopted via
+     *    acceptPeerIdentityChange() after the user verifies the safety number.
      *
      * @private
      * @param {string} otherUserId - Peer user ID
      * @returns {Promise<string|null>} Base64 public key or null
+     * @throws {PeerIdentityChangedError} when the pinned X25519 IK has changed
      */
     async _getPinnedPeerKey(otherUserId) {
         const fetched = await HistoricalKeysService.getCurrentKey(otherUserId);
@@ -1491,7 +1570,8 @@ const KeyManagementService = {
             return fetched;
         }
 
-        // Key changed: WARN (one-shot per distinct new key), do not block.
+        // CHANGED: fail closed. Warn once (for any UI listener), then THROW so no
+        // session key is ever derived against an unverified new identity key.
         if (pinned.lastWarnedFingerprint !== fp) {
             if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
                 window.dispatchEvent(new CustomEvent('peerKeyChanged', {
@@ -1505,10 +1585,72 @@ const KeyManagementService = {
             await KeyStorageService.updatePinnedWarn(otherUserId, fp);
         }
 
-        // Clean-break / smooth-UX: adopt + re-pin the new key (pinKey preserves
-        // lastWarnedFingerprint), so we keep working and only warn once.
-        await KeyStorageService.pinKey(otherUserId, fetched, fp);
-        return fetched;
+        throw this._peerIdentityChangedError({
+            userId: otherUserId,
+            oldFingerprint: pinned.fingerprint,
+            newFingerprint: fp,
+            keyType: 'identity'
+        });
+    },
+
+    /**
+     * Adopt a CHANGED peer identity — to be called ONLY after the user has verified
+     * the new identity out-of-band (e.g. compared the safety number via
+     * getSafetyNumber). Re-pins BOTH the X25519 identity key and the Ed25519 IK_sig
+     * to whatever the server currently publishes, clearing the fail-closed block so
+     * the next establishSession proceeds. This is how legitimate key rotation /
+     * device re-pair is accepted.
+     *
+     * Covers BOTH key types in one call (the common case: a re-paired peer presents
+     * a new IK + new IK_sig together). It is idempotent and tolerant of a peer that
+     * only changed one of the two.
+     *
+     * SECURITY: never call this automatically on a change event — that would restore
+     * the old fail-open behavior. It must be gated behind explicit user verification.
+     *
+     * @param {string} otherUserId - Peer user id whose identity the user accepts
+     * @returns {Promise<{accepted:boolean, identityFingerprint?:string, signFingerprint?:string}>}
+     */
+    async acceptPeerIdentityChange(otherUserId) {
+        if (!this.initialized) {
+            throw new Error('[KeyManagementService] Not initialized');
+        }
+        if (!otherUserId) {
+            throw new Error('[KeyManagementService] acceptPeerIdentityChange requires a userId');
+        }
+
+        const out = { accepted: false };
+
+        // 1) X25519 identity key — re-pin to the currently published value.
+        const fetched = await HistoricalKeysService.getCurrentKey(otherUserId);
+        if (fetched) {
+            const fp = CryptoPrimitivesService.getKeyFingerprint(
+                CryptoPrimitivesService.deserializeKey(fetched)
+            );
+            await KeyStorageService.pinKey(otherUserId, fetched, fp);
+            out.identityFingerprint = fp;
+            out.accepted = true;
+        }
+
+        // 2) Ed25519 IK_sig — re-pin from the peer's published prekey bundle row.
+        try {
+            const preTable = this._config?.tables?.prekeys || 'prekeys';
+            const res = await this._database.querySelect(preTable, { filter: { user_id: otherUserId } });
+            const row = res && res.data && res.data[0];
+            if (row && row.identity_sign_pub) {
+                const signPinId = this._signPinId(otherUserId);
+                const signFp = CryptoPrimitivesService.getKeyFingerprint(
+                    CryptoPrimitivesService.deserializeKey(row.identity_sign_pub)
+                );
+                await KeyStorageService.pinKey(signPinId, row.identity_sign_pub, signFp);
+                out.signFingerprint = signFp;
+                out.accepted = true;
+            }
+        } catch (e) {
+            console.warn('[KeyManagementService] acceptPeerIdentityChange: could not re-pin IK_sig:', e.message);
+        }
+
+        return out;
     },
 
     /**
