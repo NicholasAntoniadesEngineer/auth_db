@@ -1,3 +1,13 @@
+-- ============================================================
+-- auth_db — COMPLETE IDENTITY / E2E-CRYPTO SCHEMA (run ONCE on a fresh database)
+-- Single self-contained file: extensions + all identity tables/policies/pairing.
+-- DESTRUCTIVE (DROPs) — fresh install only. For an existing DB add pairing via
+-- add-device-pairing.sql.
+-- ============================================================
+-- Extensions (required on a fresh project; idempotent)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
 -- ============================================================================
 -- AUTH_DB — IDENTITY / E2E CRYPTO SCHEMA (canonical)
 -- ============================================================================
