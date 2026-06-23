@@ -1683,37 +1683,113 @@ const KeyManagementService = {
     },
 
     /**
-     * Export the material a NEW device needs to read ALL existing data: the identity
-     * secret (so ECDH sessions re-derive) AND the session backup key (so stored
-     * session keys restore). Used ONLY by the device-pairing flow, which wraps this
-     * bundle under a high-entropy, single-use, expiring code (PBKDF2 + AES-GCM)
-     * before it ever touches the server. The raw secret never leaves unprotected.
-     * @returns {Promise<{v:number, identitySecretB64:string, sessionBackupKeyB64:(string|null)}>}
+     * Current pairing-bundle format version. v2 (FORWARD_SECRECY_DESIGN §6) adds the
+     * Double Ratchet WORLD SNAPSHOT so a newly paired device can read history AND
+     * continue conversations seamlessly (sequential device hand-off). v1 bundles
+     * (identity secret + session backup key only) still import (fresh-ratchet path).
+     */
+    PAIRING_BUNDLE_VERSION: 2,
+
+    /**
+     * Export the material a NEW device needs to read ALL existing data AND continue
+     * the conversation (FORWARD_SECRECY_DESIGN §6 — bundle v2):
+     *
+     *   - identitySecretB64    : X25519 identity secret (reused; ratchet roots + IK).
+     *   - identitySignSecretB64: Ed25519 IK_sig secret (§6 explicit carry). It is
+     *     ALSO deterministically derivable from the X25519 secret via HKDF
+     *     (_getIdentitySignKeyPair), so it is belt-and-suspenders — included so a
+     *     future change to the IK_sig derivation can't strand a paired device, and to
+     *     match §6's listed contents faithfully.
+     *   - sessionBackupKeyB64  : legacy session-backup key (still carried, unchanged).
+     *   - ratchetSnapshot      : the §6 ratchet WORLD — every ratchet_states record,
+     *     the §5 decrypted_message_keys archive (read history), skipped_message_keys,
+     *     and prekey_secrets (SPK/OPK). Every secret is unwrapped from this device's
+     *     local (non-extractable, per-device) wrap key and emitted as base64; the new
+     *     device RE-WRAPS them under its own wrap key on import. Raw plaintext secrets
+     *     NEVER touch the server: the WHOLE bundle (snapshot included) is encrypted by
+     *     the existing pairing TRANSPORT crypto (devicePairingService ->
+     *     PasswordCryptoService PBKDF2-600k + AES-256-GCM under the single-use code)
+     *     before it leaves the device — the same envelope the identity secret already
+     *     travels in.
+     *
+     * MULTI-DEVICE LIMITATION (documented, not half-built — §6): this snapshot enables
+     * SEQUENTIAL device use — pair, then CONTINUE on the new device. It does NOT
+     * support TWO devices active at once on the same identity: both would advance the
+     * SAME live ratchet chain and permanently desync (single active ratchet per
+     * identity). TRUE simultaneous multi-device (per-device identities / sender-key
+     * fan-out, Sesame-style) is OUT OF SCOPE; it requires multiple identity/prekey
+     * rows per user (a schema rethink). The clean-break + single-active-device usage
+     * makes this acceptable.
+     *
+     * @returns {Promise<{v:number, identitySecretB64:string, identitySignSecretB64:string, sessionBackupKeyB64:(string|null), ratchetSnapshot:Object}>}
      */
     async exportPairingBundle() {
         if (!this.currentUserId) throw new Error('[KeyManagementService] Not initialized');
         const keys = await KeyStorageService.getIdentityKeys(this.currentUserId);
         if (!keys || !keys.secretKey) throw new Error('No local identity keys to share');
+
+        // Ed25519 IK_sig secret (deterministic from the X25519 secret; carried per §6).
+        let identitySignSecretB64 = null;
+        try {
+            const signKeys = await this._getIdentitySignKeyPair();
+            identitySignSecretB64 = CryptoPrimitivesService.serializeKey(signKeys.secretKey);
+        } catch (e) {
+            console.warn('[KeyManagementService] exportPairingBundle: could not derive IK_sig secret:', e.message);
+        }
+
+        // The ratchet world (states + archive + skipped + prekey secrets). Secrets are
+        // unwrapped here; the pairing transport layer re-encrypts the whole bundle.
+        const ratchetSnapshot = await KeyStorageService.exportRatchetSnapshot(this.currentUserId);
+
         return {
-            v: 1,
+            v: this.PAIRING_BUNDLE_VERSION,
             identitySecretB64: CryptoPrimitivesService.serializeKey(keys.secretKey),
+            identitySignSecretB64,
             sessionBackupKeyB64: this._sessionBackupKey
                 ? CryptoPrimitivesService.serializeKey(this._sessionBackupKey)
-                : null
+                : null,
+            ratchetSnapshot
         };
     },
 
     /**
-     * Install a pairing bundle on a NEW device: derive the public key from the
-     * transferred secret, store the identity locally (wrapped at rest, SM-02), adopt
-     * the session backup key, then sync sessions + partner keys so existing history
-     * is readable. Mirrors restoreFromPassword's post-restore sync.
+     * Install a pairing bundle on a NEW device (FORWARD_SECRECY_DESIGN §6).
+     *
+     * Always (v1 and v2):
+     *   - derive the public key from the transferred X25519 secret, store the identity
+     *     locally (wrapped at rest, SM-02), adopt the session backup key, self-heal the
+     *     server's published key, sync partner keys (mirrors restoreFromPassword).
+     *
+     * v2 only (bundle.v >= 2 with a ratchetSnapshot):
+     *   - restore the ratchet WORLD (states + §5 archive + skipped + prekey secrets),
+     *     RE-WRAPPED under THIS device's wrap key. ADDITIVE + IDEMPOTENT: an existing
+     *     local ratchet state for a conversation is NOT clobbered (a live local state
+     *     is authoritative — overwriting it with a possibly-older snapshot would
+     *     desync the conversation; §6). The archive/skipped/prekey stores are keyed by
+     *     identity-stable ids and safely upserted. After this the new device can read
+     *     HISTORY (archive) and CONTINUE conversations (restored live state).
+     *
+     * BACKWARD-COMPAT (v1 bundle, no ratchetSnapshot):
+     *   - imports fine — the new device just has its identity + backup key and NO
+     *     ratchet state. It will start FRESH ratchets via X3DH on the next message
+     *     and re-publish its own prekeys (caller drives publishPrekeys / the next
+     *     establishSession). History encrypted under the prior ratchet is NOT readable
+     *     on this device for a v1 bundle (no archive transferred) — that is the cost of
+     *     an old-format bundle and is the clean-break-permitted behavior.
+     *
+     * MULTI-DEVICE LIMITATION: SEQUENTIAL hand-off only (see exportPairingBundle).
+     * Two devices active on one identity will desync the live ratchet; simultaneous
+     * multi-device is OUT OF SCOPE.
+     *
      * @param {Object} bundle - from exportPairingBundle on the other device
-     * @returns {Promise<{success:boolean}>}
+     * @returns {Promise<{success:boolean, v:number, ratchetSnapshotRestored:boolean, snapshotStats?:Object, notes:string[]}>}
      */
     async importPairingBundle(bundle) {
         if (!this.currentUserId) throw new Error('[KeyManagementService] Not initialized');
         if (!bundle || !bundle.identitySecretB64) throw new Error('Invalid pairing bundle');
+
+        const bundleVersion = bundle.v || 1;
+        const notes = [];
 
         const secretKey = CryptoPrimitivesService.deserializeKey(bundle.identitySecretB64);
         const keyPair = CryptoPrimitivesService.keyPairFromSecretKey(secretKey);
@@ -1739,9 +1815,66 @@ const KeyManagementService = {
         await HistoricalKeysService.syncToLocal(this.currentUserId);
         await this._syncConversationPartnerKeys(this.currentUserId);
 
+        // NOTE on IK_sig: bundle.identitySignSecretB64 is carried (§6) but NOT written
+        // separately — the IK_sig keypair is regenerated deterministically from the
+        // X25519 identity secret on demand (_getIdentitySignKeyPair), and that secret
+        // is now stored above. We deliberately do not persist a second copy (single
+        // source of truth). The carried field is forward-compat insurance only.
+
+        // ---- v2: restore the ratchet world snapshot (additive, no-clobber) ----
+        let ratchetSnapshotRestored = false;
+        let snapshotStats;
+        if (bundleVersion >= 2 && bundle.ratchetSnapshot) {
+            snapshotStats = await KeyStorageService.importRatchetSnapshot(
+                this.currentUserId, bundle.ratchetSnapshot
+            );
+            ratchetSnapshotRestored = true;
+            notes.push(
+                `Ratchet snapshot restored: ${snapshotStats.ratchetStates} conversation state(s) ` +
+                `(${snapshotStats.ratchetStatesSkipped} left untouched as already-present), ` +
+                `${snapshotStats.decryptedMessageKeys} archived history key(s), ` +
+                `${snapshotStats.skippedMessageKeys} skipped-key(s), ` +
+                `${snapshotStats.prekeySecrets} prekey secret(s). ` +
+                `This device can now READ HISTORY and CONTINUE these conversations.`
+            );
+            notes.push(
+                'SEQUENTIAL device hand-off only: if the OTHER device keeps sending on the ' +
+                'same ratchet, the two devices will desync (single active ratchet per identity). ' +
+                'Simultaneous multi-device is OUT OF SCOPE (FORWARD_SECRECY_DESIGN §6).'
+            );
+        } else {
+            notes.push(
+                `v${bundleVersion} bundle (no ratchet snapshot): this device starts FRESH ratchets. ` +
+                'Existing conversations re-bootstrap via X3DH on the next message; the caller should ' +
+                're-publish prekeys (publishPrekeys). History encrypted under the prior ratchet is ' +
+                'NOT readable here (no archive transferred) — clean-break behavior.'
+            );
+        }
+
+        // The new device must republish ITS prekey pool so peers can keep starting
+        // sessions against this shared identity. Best-effort (needs a DB); never fatal
+        // to pairing — a v1 path or a DB-less context still completes the import.
+        let prekeysRepublished = false;
+        try {
+            if (this._database) {
+                await this.publishPrekeys();
+                prekeysRepublished = true;
+                notes.push('Republished this device\'s SPK + OPK pool to the server.');
+            }
+        } catch (e) {
+            console.warn('[KeyManagementService] importPairingBundle: publishPrekeys after pairing failed (non-fatal):', e.message);
+            notes.push('publishPrekeys after pairing failed (non-fatal): ' + e.message);
+        }
+
         this.initialized = true;
-        console.log('[KeyManagementService] Pairing bundle imported');
-        return { success: true };
+        console.log(`[KeyManagementService] Pairing bundle v${bundleVersion} imported (snapshot=${ratchetSnapshotRestored}, prekeys=${prekeysRepublished})`);
+        return {
+            success: true,
+            v: bundleVersion,
+            ratchetSnapshotRestored,
+            snapshotStats,
+            notes
+        };
     },
 
     /**

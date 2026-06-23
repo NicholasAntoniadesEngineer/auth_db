@@ -112,6 +112,11 @@ class FakeObjectStore {
         req._succeed(this._data.get(compositeKeyFromValue(this.keyPath, key)));
         return req;
     }
+    getAll() {
+        const req = new FakeRequest();
+        req._succeed(Array.from(this._data.values()));
+        return req;
+    }
     put(record) {
         const req = new FakeRequest();
         this._data.set(compositeKey(this.keyPath, record), record);

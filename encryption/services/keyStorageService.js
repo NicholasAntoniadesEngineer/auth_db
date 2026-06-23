@@ -1409,6 +1409,246 @@ const KeyStorageService = {
         });
     },
 
+    // ============ Ratchet-world SNAPSHOT for device pairing (S7, §6) ============
+    //
+    // FORWARD_SECRECY_DESIGN §6 upgrades the pairing bundle to v2 so a newly paired
+    // device can (a) read message HISTORY (the §5 archive) and (b) CONTINUE existing
+    // conversations on the transferred live ratchet state — i.e. SEQUENTIAL device
+    // hand-off. These two helpers serialize / restore the full ratchet world.
+    //
+    // CRYPTO BOUNDARY (do NOT export raw plaintext secrets to the server):
+    //   - The at-rest wrap key (wrap_keys, SM-02) is NON-EXTRACTABLE and PER-DEVICE,
+    //     so device B literally cannot open device A's wrapped blobs. The snapshot
+    //     therefore UNWRAPS each secret with A's local wrap key, ships the bytes as
+    //     base64 INSIDE the pairing bundle, and B RE-WRAPS them under B's own wrap
+    //     key on import. The bytes are never at rest unwrapped and never on the wire
+    //     in the clear: the WHOLE bundle (this snapshot included) is encrypted by the
+    //     existing pairing TRANSPORT crypto (devicePairingService ->
+    //     PasswordCryptoService.encryptToBase64: PBKDF2-600k + AES-256-GCM under the
+    //     single-use pairing code) before it ever touches the server. This is exactly
+    //     how the identity secret already travels (base64 in the bundle, protected by
+    //     the transport layer) — the snapshot reuses that same transport envelope.
+    //
+    // SCOPE (KNOWN LIMITATION — documented, not half-built): this is a SEQUENTIAL
+    // snapshot. After import, device B continues the conversations; if device A keeps
+    // sending on the SAME ratchet the two devices advance the same chain and desync
+    // (single active ratchet per identity). TRUE simultaneous multi-device (per-device
+    // sessions / Sesame-style peer fan-out) is OUT OF SCOPE (§6) — it needs multiple
+    // identity/prekey rows per user, a schema rethink. We do NOT attempt it here.
+
+    /**
+     * Read every record of a store (raw, including the wrapped blobs).
+     * @private
+     * @param {string} storeName
+     * @returns {Promise<Array<Object>>}
+     */
+    async _getAllRecords(storeName) {
+        this._ensureInitialized();
+        if (!this.db.objectStoreNames.contains(storeName)) {
+            return [];
+        }
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction(storeName, 'readonly');
+            const store = tx.objectStore(storeName);
+            const request = store.getAll();
+            request.onsuccess = () => resolve(request.result || []);
+            request.onerror = () => reject(request.error);
+        });
+    },
+
+    /**
+     * Export a transport-ready snapshot of the FULL ratchet world for device pairing
+     * (§6): every ratchet_states record, the decrypted_message_keys archive (so the
+     * new device can read history), skipped_message_keys, and prekey_secrets (SPK +
+     * OPK secrets). Each secret is UNWRAPPED with this device's local wrap key and
+     * emitted as base64 — the caller (exportPairingBundle) embeds this in the bundle,
+     * which the pairing transport layer encrypts before it leaves the device.
+     *
+     * Returns plain JSON-safe objects (base64 strings only) so JSON.stringify in the
+     * pairing flow is lossless.
+     *
+     * @param {string} userId - owner id (scopes prekey_secrets to this identity)
+     * @returns {Promise<Object>} { v, ratchetStates[], decryptedMessageKeys[], skippedMessageKeys[], prekeySecrets[] }
+     */
+    async exportRatchetSnapshot(userId) {
+        this._ensureInitialized();
+        const b64 = (bytes) => CryptoPrimitivesService.serializeKey(bytes);
+
+        // ratchet_states: unwrap each state blob back to its serialized JSON-safe
+        // form (NOT the live object) so it ships as-is and re-wraps verbatim on B.
+        const ratchetStates = [];
+        for (const rec of await this._getAllRecords('ratchet_states')) {
+            if (!rec.wrappedState || !rec.wrapIv) continue;
+            const plaintextBytes = await this._unwrapSecret(rec.wrappedState, rec.wrapIv);
+            ratchetStates.push({
+                conversationId: rec.conversationId,
+                // the serialized (base64-field) ratchet state object; re-wrapped on import
+                state: JSON.parse(CryptoPrimitivesService.decodeUTF8(plaintextBytes)),
+                version: rec.version || 2
+            });
+        }
+
+        // decrypted_message_keys: the §5 history archive (message id -> MK).
+        const decryptedMessageKeys = [];
+        for (const rec of await this._getAllRecords('decrypted_message_keys')) {
+            if (!rec.wrappedKey || !rec.wrapIv) continue;
+            const mk = await this._unwrapSecret(rec.wrappedKey, rec.wrapIv);
+            decryptedMessageKeys.push({
+                messageId: rec.messageId,
+                conversationId: rec.conversationId != null ? rec.conversationId : null,
+                mk: b64(mk)
+            });
+        }
+
+        // skipped_message_keys: the persisted MKSKIPPED map.
+        const skippedMessageKeys = [];
+        for (const rec of await this._getAllRecords('skipped_message_keys')) {
+            if (!rec.wrappedKey || !rec.wrapIv) continue;
+            const mk = await this._unwrapSecret(rec.wrappedKey, rec.wrapIv);
+            skippedMessageKeys.push({
+                conversationId: rec.conversationId,
+                ratchetPub: rec.ratchetPub,
+                msgNum: rec.msgNum | 0,
+                mk: b64(mk)
+            });
+        }
+
+        // prekey_secrets: SPK + OPK secret keypairs for THIS identity. The new device
+        // can keep using these to bootstrap responder sessions (it shares the identity
+        // + the published prekeys) until it republishes its own.
+        const prekeySecrets = [];
+        for (const rec of await this._getAllRecords('prekey_secrets')) {
+            if (rec.userId !== userId) continue;
+            if (!rec.wrappedKeyPair || !rec.wrapIv) continue;
+            const joined = await this._unwrapSecret(rec.wrappedKeyPair, rec.wrapIv);
+            const pubLen = rec.pubLen || 32;
+            prekeySecrets.push({
+                kind: rec.kind,
+                keyId: rec.keyId | 0,
+                publicKey: b64(joined.slice(0, pubLen)),
+                secretKey: b64(joined.slice(pubLen))
+            });
+        }
+
+        return {
+            v: 1, // snapshot inner format version (independent of the bundle v)
+            ratchetStates,
+            decryptedMessageKeys,
+            skippedMessageKeys,
+            prekeySecrets
+        };
+    },
+
+    /**
+     * Restore a snapshot from exportRatchetSnapshot onto THIS device, RE-WRAPPING
+     * every secret under this device's local wrap key. ADDITIVE + IDEMPOTENT:
+     *
+     *   - ratchet_states: by default we DO NOT clobber an existing local ratchet
+     *     state for a conversation. A live local ratchet is newer/authoritative — the
+     *     §6 desync hazard means blindly overwriting it with the snapshot's (possibly
+     *     older) state would break the live conversation. On a FRESH paired device
+     *     there is nothing local, so every state restores; on a device that already
+     *     has state, the snapshot is skipped for that conversation (logged). Pass
+     *     opts.overwriteRatchetStates=true only when you explicitly want a clean
+     *     re-seed.
+     *   - decrypted_message_keys / skipped_message_keys / prekey_secrets: keyed by
+     *     identity-stable ids, safe to upsert (re-writing the same key with the same
+     *     bytes is a no-op), so we always restore them (additive).
+     *
+     * @param {string} userId - owner id (for prekey_secrets scoping)
+     * @param {Object} snapshot - from exportRatchetSnapshot
+     * @param {Object} [opts] - { overwriteRatchetStates?:boolean }
+     * @returns {Promise<{ratchetStates:number, decryptedMessageKeys:number, skippedMessageKeys:number, prekeySecrets:number, ratchetStatesSkipped:number}>}
+     */
+    async importRatchetSnapshot(userId, snapshot, opts = {}) {
+        this._ensureInitialized();
+        if (!snapshot) return { ratchetStates: 0, decryptedMessageKeys: 0, skippedMessageKeys: 0, prekeySecrets: 0, ratchetStatesSkipped: 0 };
+        const de = (s) => CryptoPrimitivesService.deserializeKey(s);
+        const overwrite = opts.overwriteRatchetStates === true;
+
+        let nState = 0, nStateSkipped = 0, nArchive = 0, nSkipped = 0, nPrekey = 0;
+
+        // ----- ratchet_states (do NOT clobber a newer local state without care) -----
+        for (const entry of (snapshot.ratchetStates || [])) {
+            const convId = String(entry.conversationId);
+            if (!overwrite) {
+                const existing = await new Promise((resolve, reject) => {
+                    const tx = this.db.transaction('ratchet_states', 'readonly');
+                    const request = tx.objectStore('ratchet_states').get(convId);
+                    request.onsuccess = () => resolve(request.result || null);
+                    request.onerror = () => reject(request.error);
+                });
+                if (existing) {
+                    nStateSkipped++;
+                    console.warn(`[KeyStorageService] importRatchetSnapshot: local ratchet state for conv=${convId} present — NOT clobbering (sequential-device safety, §6)`);
+                    continue;
+                }
+            }
+            // Re-wrap the serialized state object under THIS device's wrap key, using
+            // the same on-disk record shape putRatchetState writes.
+            const plaintextBytes = CryptoPrimitivesService.encodeUTF8(JSON.stringify(entry.state));
+            const { wrapped, iv } = await this._wrapSecret(plaintextBytes);
+            await new Promise((resolve, reject) => {
+                const tx = this.db.transaction('ratchet_states', 'readwrite');
+                const request = tx.objectStore('ratchet_states').put({
+                    conversationId: convId,
+                    wrappedState: wrapped,
+                    wrapIv: iv,
+                    version: entry.version || 2,
+                    updatedAt: new Date().toISOString()
+                });
+                request.onsuccess = () => resolve();
+                request.onerror = () => reject(request.error);
+            });
+            nState++;
+        }
+
+        // ----- decrypted_message_keys archive (additive upsert) -----
+        for (const entry of (snapshot.decryptedMessageKeys || [])) {
+            await this.putDecryptedMessageKey(entry.messageId, de(entry.mk), entry.conversationId);
+            nArchive++;
+        }
+
+        // ----- skipped_message_keys (additive upsert; bypass the MAX_SKIP throw by
+        // writing the wrapped record directly — these are already-bounded entries we
+        // are restoring, not new peer-driven skips) -----
+        for (const entry of (snapshot.skippedMessageKeys || [])) {
+            const { wrapped, iv } = await this._wrapSecret(de(entry.mk));
+            await new Promise((resolve, reject) => {
+                const tx = this.db.transaction('skipped_message_keys', 'readwrite');
+                const request = tx.objectStore('skipped_message_keys').put({
+                    conversationId: String(entry.conversationId),
+                    ratchetPub: entry.ratchetPub,
+                    msgNum: entry.msgNum | 0,
+                    wrappedKey: wrapped,
+                    wrapIv: iv,
+                    createdAt: new Date().toISOString()
+                });
+                request.onsuccess = () => resolve();
+                request.onerror = () => reject(request.error);
+            });
+            nSkipped++;
+        }
+
+        // ----- prekey_secrets (SPK + OPK; additive upsert via the existing helper) -----
+        for (const entry of (snapshot.prekeySecrets || [])) {
+            await this._putPrekeySecret(userId, entry.kind, entry.keyId, {
+                publicKey: de(entry.publicKey),
+                secretKey: de(entry.secretKey)
+            });
+            nPrekey++;
+        }
+
+        console.log(`[KeyStorageService] importRatchetSnapshot: states=${nState} (skipped ${nStateSkipped}), archive=${nArchive}, skippedKeys=${nSkipped}, prekeys=${nPrekey}`);
+        return {
+            ratchetStates: nState,
+            ratchetStatesSkipped: nStateSkipped,
+            decryptedMessageKeys: nArchive,
+            skippedMessageKeys: nSkipped,
+            prekeySecrets: nPrekey
+        };
+    },
+
     // ==================== Database Management ====================
 
     /**
