@@ -771,6 +771,44 @@ const AuthService = {
             });
         }
         
+        // SECURITY (H-NEW-1): actively destroy local E2E secret state BEFORE the
+        // redirect. Clearing in-memory user/session + localStorage above does NOT
+        // touch the encryption IndexedDB (MoneyTrackerEncryption), which holds the
+        // wrapped identity secret, ratchet states, the decrypted-message-key
+        // archive, prekey secrets, session keys AND the at-rest AES-GCM wrap key
+        // (the wrap key auto-loads with no auth gate, so a local-access attacker
+        // could otherwise recover the identity secret + full history). Wipe it.
+        //
+        // Use deleteDatabase() (not clearAll()) so the wrap_keys store is dropped
+        // too — clearAll() intentionally preserves the usable wrap key. These calls
+        // are AWAITED so the redirect cannot race a fire-and-forget wipe, and each
+        // is try/catch-wrapped so any failure still proceeds to the redirect.
+        //
+        // NO LOCKOUT: this is safe because the identity is also held in the
+        // server-side, password-encrypted backup (identity_key_backups). On the
+        // next sign-in KeyManagementService.initialize() finds no local keys +
+        // an existing backup → needsRestore, and restoreFromPassword() re-derives
+        // the identity (and re-creates the wrap key) from that backup. Only the
+        // plaintext-equivalent decrypted-message-key archive and forward-secrecy
+        // ratchet state are not re-derived — exactly what should not survive logout.
+        try {
+            if (window.KeyStorageService && typeof window.KeyStorageService.deleteDatabase === 'function') {
+                console.log('[AuthService] Wiping encryption IndexedDB (deleteDatabase)...');
+                await window.KeyStorageService.deleteDatabase();
+                console.log('[AuthService] Encryption IndexedDB wiped');
+            }
+        } catch (wipeError) {
+            console.warn('[AuthService] Failed to wipe encryption IndexedDB (continuing to redirect):', wipeError);
+        }
+        try {
+            if (window.BudgetKeyService && typeof window.BudgetKeyService.clearCache === 'function') {
+                console.log('[AuthService] Clearing BudgetKeyService cache...');
+                window.BudgetKeyService.clearCache();
+            }
+        } catch (cacheError) {
+            console.warn('[AuthService] Failed to clear BudgetKeyService cache (continuing to redirect):', cacheError);
+        }
+
         // Determine redirect path using absolute URL (works with file:// protocol)
         const baseUrl = window.location.origin;
         const currentPath = window.location.pathname;

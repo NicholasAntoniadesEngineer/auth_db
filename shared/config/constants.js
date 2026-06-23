@@ -65,7 +65,7 @@ const Constants = {
      * Validation constants
      */
     VALIDATION: {
-        MIN_PASSWORD_LENGTH: 6,
+        MIN_PASSWORD_LENGTH: 12,
         MIN_YEAR: 2000,
         MAX_YEAR: 2100,
         MIN_MONTH: 1,

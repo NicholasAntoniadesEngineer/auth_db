@@ -42,7 +42,7 @@ const Validators = {
      */
     password(password) {
         if (!password) return false;
-        const minLength = window.Constants?.VALIDATION?.MIN_PASSWORD_LENGTH || 6;
+        const minLength = window.Constants?.VALIDATION?.MIN_PASSWORD_LENGTH || 12;
         return password.length >= minLength;
     },
 
