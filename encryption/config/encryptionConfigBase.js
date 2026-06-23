@@ -84,7 +84,7 @@ const EncryptionConfigBase = {
      */
     indexedDB: {
         name: 'MoneyTrackerEncryption',
-        version: 2,
+        version: 3,
         stores: {
             identityKeys: 'identity_keys',
             sessionKeys: 'session_keys',
@@ -96,7 +96,9 @@ const EncryptionConfigBase = {
             // never replaces the stores above (additive onupgradeneeded).
             ratchetStates: 'ratchet_states',
             skippedMessageKeys: 'skipped_message_keys',
-            decryptedMessageKeys: 'decrypted_message_keys'
+            decryptedMessageKeys: 'decrypted_message_keys',
+            // S5 (forward secrecy): X3DH prekey SECRETS (SPK/OPK). ADDED in v3.
+            prekeySecrets: 'prekey_secrets'
         }
     },
 
@@ -109,7 +111,12 @@ const EncryptionConfigBase = {
         identityKeyBackups: 'identity_key_backups',
         conversationSessionKeys: 'conversation_session_keys',
         messages: 'messages',
-        pairedDevices: 'paired_devices'
+        pairedDevices: 'paired_devices',
+        // S5 (forward secrecy): X3DH prekey publication. SELECT-able by any peer
+        // (session bootstrap), owner-only writes (RLS). One-time prekeys are
+        // consumed atomically via the claim_one_time_prekey() RPC, not client DELETE.
+        prekeys: 'prekeys',
+        oneTimePrekeys: 'one_time_prekeys'
     },
 
     /**

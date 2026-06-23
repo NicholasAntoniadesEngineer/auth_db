@@ -36,7 +36,7 @@ const MoneyTrackerEncryptionConfig = EncryptionConfigBase.merge({
 
     indexedDB: {
         name: 'MoneyTrackerEncryption',
-        version: 2,
+        version: 3,
         stores: {
             identityKeys: 'identity_keys',
             sessionKeys: 'session_keys',
@@ -48,7 +48,9 @@ const MoneyTrackerEncryptionConfig = EncryptionConfigBase.merge({
             // never replaces the stores above (additive onupgradeneeded).
             ratchetStates: 'ratchet_states',
             skippedMessageKeys: 'skipped_message_keys',
-            decryptedMessageKeys: 'decrypted_message_keys'
+            decryptedMessageKeys: 'decrypted_message_keys',
+            // S5 (forward secrecy): X3DH prekey SECRETS (SPK/OPK). ADDED in v3.
+            prekeySecrets: 'prekey_secrets'
         }
     },
 
@@ -58,7 +60,10 @@ const MoneyTrackerEncryptionConfig = EncryptionConfigBase.merge({
         identityKeyBackups: 'identity_key_backups',
         conversationSessionKeys: 'conversation_session_keys',
         messages: 'messages',
-        pairedDevices: 'paired_devices'
+        pairedDevices: 'paired_devices',
+        // S5 (forward secrecy): X3DH prekey publication tables.
+        prekeys: 'prekeys',
+        oneTimePrekeys: 'one_time_prekeys'
     },
 
     features: {

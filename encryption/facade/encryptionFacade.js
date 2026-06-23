@@ -151,19 +151,47 @@ const EncryptionFacade = {
     },
 
     /**
-     * Decrypt a message
+     * Decrypt a message (Double Ratchet, FORWARD_SECRECY_DESIGN §5/§6).
      * @param {number|string} conversationId - Conversation ID
-     * @param {Object} encryptedData - { ciphertext, nonce, counter, epoch }
+     * @param {Object} encryptedData - { ciphertext, nonce, id, header, x3dhPreamble?, _messageKey? }
      * @param {string} senderId - Sender's user ID
      * @param {string} recipientId - Recipient's user ID (needed for decrypting own messages)
-     * @returns {Promise<string>} Decrypted plaintext
+     * @param {Object} [options] - { liveAdvance:boolean } true = realtime arrival
+     *        (advance the live ratchet + mint the archive); false/omitted = batch
+     *        history re-render (ARCHIVE-ONLY, never advances the ratchet).
+     * @returns {Promise<string>} Decrypted plaintext (or the legacy/unavailable sentinel)
      */
-    async decryptMessage(conversationId, encryptedData, senderId, recipientId = null) {
+    async decryptMessage(conversationId, encryptedData, senderId, recipientId = null, options = {}) {
         if (!this.initialized || !this._keysExist) {
             throw new Error('[EncryptionFacade] Encryption not set up');
         }
 
-        return await KeyManagementService.decryptMessage(conversationId, encryptedData, senderId, recipientId);
+        return await KeyManagementService.decryptMessage(conversationId, encryptedData, senderId, recipientId, options);
+    },
+
+    /**
+     * Publish (or rotate) this user's X3DH prekey bundle + replenish the OPK pool.
+     * Idempotent; call after key setup / on login. Delegates to KeyManagementService.
+     * @returns {Promise<Object>}
+     */
+    async publishPrekeys() {
+        if (!this.initialized || !this._keysExist) {
+            throw new Error('[EncryptionFacade] Encryption not set up');
+        }
+        return await KeyManagementService.publishPrekeys();
+    },
+
+    /**
+     * Archive a sender-side per-message key once the DB returns the message id (§5).
+     * @param {number|string} conversationId
+     * @param {number|string} messageId
+     * @param {Uint8Array} messageKey
+     */
+    async archiveSentMessageKey(conversationId, messageId, messageKey) {
+        if (!this.initialized || !this._keysExist) {
+            throw new Error('[EncryptionFacade] Encryption not set up');
+        }
+        return await KeyManagementService.archiveSentMessageKey(conversationId, messageId, messageKey);
     },
 
     /**

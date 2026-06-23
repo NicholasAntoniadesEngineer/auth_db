@@ -588,6 +588,20 @@ const KeyManagementService = {
      * @returns {Promise<Object>} { success: boolean, newEpoch: number }
      */
     async regenerateKeys() {
+        // RETIRED (FORWARD_SECRECY_DESIGN §4.2): identity-key rotation is replaced
+        // by the Double Ratchet, which provides forward secrecy + post-compromise
+        // security per message without rotating the long-term identity. Rotating the
+        // identity now would orphan every live ratchet (their X3DH roots were derived
+        // from the OLD identity) and break decryption. To re-key, the user re-pairs /
+        // re-publishes prekeys (a clean break), which re-bootstraps sessions via X3DH.
+        throw new Error('[KeyManagementService] regenerateKeys is retired — the Double Ratchet supersedes identity-key rotation (see FORWARD_SECRECY_DESIGN §4.2)');
+    },
+
+    /**
+     * @deprecated retired with regenerateKeys; kept only so the old lock helper is
+     * not dead-referenced. (No call path reaches it.)
+     */
+    async _regenerateKeysLegacy() {
         if (!this.initialized) {
             throw new Error('[KeyManagementService] Not initialized');
         }
@@ -729,75 +743,390 @@ const KeyManagementService = {
         return `${hours}h ${minutes}m`;
     },
 
+    // ====================================================================
+    // X3DH PREKEY LIFECYCLE (S5, FORWARD_SECRECY_DESIGN §2)
+    // ====================================================================
+
     /**
-     * Establish a session with another user for a conversation
-     * @param {number|string} conversationId - Conversation ID
-     * @param {string} otherUserId - Other user's ID
-     * @returns {Promise<Object>} { sessionKey, epoch, counter }
+     * How many one-time prekeys to keep in the published pool. When the
+     * unconsumed count drops below OPK_LOW_WATER, we top back up to OPK_POOL_SIZE.
      */
-    async establishSession(conversationId, otherUserId) {
+    OPK_POOL_SIZE: 20,
+    OPK_LOW_WATER: 5,
+
+    /**
+     * HKDF info that derives the Ed25519 IK_sig SEED from the X25519 identity
+     * secret. A SEPARATE keypair (Ed25519, for signing) is required — the X25519
+     * box key cannot sign — but deriving its seed deterministically from the
+     * already-persisted+wrapped identity secret means: (a) it is never reused as
+     * the box key, (b) it is effectively "persisted wrapped" (regenerable from the
+     * wrapped X25519 secret), and (c) it travels with the existing pairing bundle
+     * automatically (the X25519 secret already does), so no bundle-version bump is
+     * needed here (the explicit v:2 carry is the S7 concern). Resolved ambiguity:
+     * the design said "separate nacl.sign keypair, persisted wrapped" — derivation
+     * from the wrapped secret satisfies both the separateness and the persistence.
+     * @private
+     */
+    _IK_SIGN_INFO: 'MoneyTracker:IK_sign:v1',
+
+    /**
+     * Derive the user's Ed25519 identity-signing keypair (IK_sig) from their
+     * X25519 identity secret. Deterministic + separate from the box key.
+     * @private
+     * @returns {Promise<{publicKey:Uint8Array(32), secretKey:Uint8Array(64)}>}
+     */
+    async _getIdentitySignKeyPair() {
+        const ourKeys = await KeyStorageService.getIdentityKeys(this.currentUserId);
+        if (!ourKeys || !ourKeys.secretKey) {
+            throw new Error('[KeyManagementService] No local identity keys - cannot derive IK_sig');
+        }
+        // 32-byte Ed25519 seed = HKDF(identity secret, IK_sign info).
+        const seed = await KeyDerivationService._hkdf(
+            ourKeys.secretKey, this._IK_SIGN_INFO, 32,
+            // explicit non-empty salt = our own X25519 public, so the seed binds to
+            // this identity; bypasses the context-salt fallback deterministically.
+            ourKeys.publicKey
+        );
+        return CryptoPrimitivesService.signKeyPairFromSeed(seed);
+    },
+
+    /**
+     * Publish (or rotate) the caller's X3DH prekey bundle and replenish the
+     * one-time-prekey pool. Idempotent + safe to call on every register/login.
+     *
+     *  - prekeys row: Ed25519 IK_sig pub + a fresh X25519 signed prekey (SPK) +
+     *    Ed25519 signature over the SPK pub + spk_id (upsert, one row per user).
+     *  - one_time_prekeys: top the unconsumed pool back up to OPK_POOL_SIZE.
+     *
+     * The SPK + OPK SECRETS are persisted locally (wrapped at rest) keyed by their
+     * id, so the responder side can recompute the X3DH DHs when an inbound
+     * bootstrap names them. Only PUBLIC material is published to the server.
+     *
+     * @returns {Promise<{success:boolean, spkId:number, opkPublished:number}>}
+     */
+    async publishPrekeys() {
+        if (!this.initialized) {
+            throw new Error('[KeyManagementService] Not initialized');
+        }
+        if (!this._database) {
+            console.warn('[KeyManagementService] publishPrekeys: no database service - skipping');
+            return { success: false, error: 'no database' };
+        }
+
+        const prekeysTable = this._config?.tables?.prekeys || 'prekeys';
+        const opkTable = this._config?.tables?.oneTimePrekeys || 'one_time_prekeys';
+
+        const signKeys = await this._getIdentitySignKeyPair();
+        const identitySignPubB64 = CryptoPrimitivesService.serializeKey(signKeys.publicKey);
+
+        // --- Signed prekey (SPK): fresh X25519 keypair, signed by IK_sig. ---
+        // Reuse the existing published SPK if one already exists locally + on the
+        // server (don't rotate on every login); otherwise mint + publish a new one.
+        let spkId = await KeyStorageService.getCurrentSignedPrekeyId(this.currentUserId);
+        let needNewSpk = (spkId === null || spkId === undefined);
+        if (!needNewSpk) {
+            // Verify the local SPK secret is still present (else mint a new one).
+            const localSpk = await KeyStorageService.getSignedPrekey(this.currentUserId, spkId);
+            if (!localSpk) needNewSpk = true;
+        }
+
+        if (needNewSpk) {
+            spkId = Date.now() & 0x7fffffff; // monotonic-ish 31-bit rotation id
+            const spk = CryptoPrimitivesService.generateKeyPair();
+            const spkSig = CryptoPrimitivesService.signDetached(spk.publicKey, signKeys.secretKey);
+
+            // Persist the SPK SECRET locally (wrapped) keyed by spkId.
+            await KeyStorageService.putSignedPrekey(this.currentUserId, spkId, spk);
+
+            const spkPubB64 = CryptoPrimitivesService.serializeKey(spk.publicKey);
+            const spkSigB64 = CryptoPrimitivesService.serializeKey(spkSig);
+
+            const result = await this._database.queryUpsert(prekeysTable, {
+                user_id: this.currentUserId,
+                identity_sign_pub: identitySignPubB64,
+                signed_prekey_pub: spkPubB64,
+                signed_prekey_sig: spkSigB64,
+                spk_id: spkId
+            }, { onConflict: 'user_id', returning: true });
+
+            if (result.error) {
+                throw new Error(`[KeyManagementService] Failed to publish prekey bundle: ${result.error.message || result.error}`);
+            }
+            console.log(`[KeyManagementService] Published signed prekey spk_id=${spkId}`);
+        }
+
+        // --- One-time prekeys (OPK) pool replenishment. ---
+        const opkPublished = await this._replenishOneTimePrekeys();
+
+        return { success: true, spkId, opkPublished };
+    },
+
+    /**
+     * Top up the published one-time-prekey pool to OPK_POOL_SIZE. Counts the
+     * UNCONSUMED rows on the server; if below the low-water mark, mints new OPKs,
+     * persists their SECRETS locally (wrapped) and publishes only the publics.
+     * @private
+     * @returns {Promise<number>} number of OPKs newly published this call
+     */
+    async _replenishOneTimePrekeys() {
+        const opkTable = this._config?.tables?.oneTimePrekeys || 'one_time_prekeys';
+
+        let unconsumed = 0;
+        try {
+            const res = await this._database.querySelect(opkTable, {
+                select: 'key_id',
+                filter: { user_id: this.currentUserId, consumed: false }
+            });
+            unconsumed = Array.isArray(res.data) ? res.data.length : 0;
+        } catch (e) {
+            console.warn('[KeyManagementService] Could not count OPK pool:', e.message);
+        }
+
+        if (unconsumed >= this.OPK_LOW_WATER) {
+            return 0;
+        }
+
+        const toCreate = this.OPK_POOL_SIZE - unconsumed;
+        const rows = [];
+        // Base the new key ids off the current max to avoid UNIQUE(user_id,key_id)
+        // collisions across replenishment rounds.
+        let nextId = await KeyStorageService.getMaxOneTimePrekeyId(this.currentUserId);
+        for (let i = 0; i < toCreate; i++) {
+            nextId += 1;
+            const opk = CryptoPrimitivesService.generateKeyPair();
+            await KeyStorageService.putOneTimePrekey(this.currentUserId, nextId, opk);
+            rows.push({
+                user_id: this.currentUserId,
+                key_id: nextId,
+                prekey_pub: CryptoPrimitivesService.serializeKey(opk.publicKey)
+            });
+        }
+
+        if (rows.length > 0) {
+            const result = await this._database.queryInsert(opkTable, rows);
+            if (result.error) {
+                throw new Error(`[KeyManagementService] Failed to publish one-time prekeys: ${result.error.message || result.error}`);
+            }
+            console.log(`[KeyManagementService] Published ${rows.length} one-time prekeys (pool now ~${unconsumed + rows.length})`);
+        }
+        return rows.length;
+    },
+
+    /**
+     * Claim a peer's prekey bundle to bootstrap a NEW session as the initiator.
+     * Atomically pops one OPK server-side (claim_one_time_prekey RPC) and fetches
+     * the peer's X25519 identity key through the TOFU pin chokepoint.
+     * @private
+     * @param {string} peerId
+     * @returns {Promise<Object>} peerBundle shaped for x3dhService.deriveInitiatorRoot
+     */
+    async _claimPeerBundle(peerId) {
+        // Peer X25519 identity key via the TOFU pin (SM-01).
+        const theirIkB64 = await this._getPinnedPeerKey(peerId);
+        if (!theirIkB64) {
+            throw new Error('Other user has no public key - they may not have set up encryption yet');
+        }
+
+        const rpc = await this._database.queryRpc('claim_one_time_prekey', { target_user_id: peerId });
+        if (rpc.error) {
+            throw new Error(`[KeyManagementService] claim_one_time_prekey failed: ${rpc.error.message || rpc.error}`);
+        }
+        const bundle = Array.isArray(rpc.data) ? rpc.data[0] : rpc.data;
+        if (!bundle || bundle.success === false) {
+            throw new Error(`[KeyManagementService] No prekey bundle for peer: ${bundle && bundle.error}`);
+        }
+
+        const hasOpk = bundle.opk_id !== null && bundle.opk_id !== undefined && bundle.opk_pub;
+        return {
+            identityKeyPub:   CryptoPrimitivesService.deserializeKey(theirIkB64),
+            identitySignPub:  CryptoPrimitivesService.deserializeKey(bundle.identity_sign_pub),
+            signedPrekeyPub:  CryptoPrimitivesService.deserializeKey(bundle.signed_prekey_pub),
+            signedPrekeySig:  CryptoPrimitivesService.deserializeKey(bundle.signed_prekey_sig),
+            spkId:            bundle.spk_id,
+            oneTimePrekeyPub: hasOpk ? CryptoPrimitivesService.deserializeKey(bundle.opk_pub) : undefined,
+            oneTimePrekeyId:  hasOpk ? bundle.opk_id : undefined,
+            // also keep the peer's Ed25519 signing pub for TOFU pinning
+            _identitySignPubB64: bundle.identity_sign_pub
+        };
+    },
+
+    /**
+     * Establish a Double Ratchet session for a conversation (FORWARD_SECRECY_DESIGN
+     * §2/§3). Replaces the old static-static ECDH session.
+     *
+     *  - Cached: if a ratchet_states record exists, return immediately.
+     *  - INITIATOR (we send first, no inbound bootstrap): claim the peer's bundle,
+     *    verify the SPK signature (fail closed, inside x3dhService), derive the
+     *    X3DH root, ratchetInitAlice, persist state, and STASH the X3DH preamble so
+     *    encryptMessage attaches it to the FIRST outbound message.
+     *  - RESPONDER (an inbound first message carried an X3DH preamble): derive the
+     *    responder root from our local SPK/OPK secrets + the preamble, ratchetInitBob,
+     *    persist state.
+     *
+     * @param {number|string} conversationId
+     * @param {string} otherUserId
+     * @param {Object} [inboundPreamble] - X3DH preamble from a first inbound message
+     *        { ikPub, ikSignPub, ekPub, spkId, opkId } (base64 strings). Present =>
+     *        responder bootstrap. Absent => initiator bootstrap.
+     * @returns {Promise<Object>} { ratchetReady:true, role, x3dhPreamble? }
+     */
+    async establishSession(conversationId, otherUserId, inboundPreamble = null) {
         if (!this.initialized) {
             throw new Error('[KeyManagementService] Not initialized');
         }
 
-        // Always use epoch 0 - key rotation is disabled for reliability
-        const epoch = 0;
-
-        // Check if session already exists
-        let session = await KeyStorageService.getSessionKey(conversationId, epoch);
-        if (session) {
-            console.log(`[KeyManagementService] establishSession: Using cached session for conv=${conversationId}`);
-            return {
-                sessionKey: session.sessionKey,
-                epoch: epoch,
-                counter: session.counter
-            };
+        // Cached ratchet -> done. (No epoch; the ratchet IS the session.)
+        const existing = await KeyStorageService.getRatchetState(conversationId);
+        if (existing) {
+            return { ratchetReady: true, role: 'cached' };
         }
 
-        console.log(`[KeyManagementService] establishSession: Creating NEW session for conv=${conversationId}`);
-
-        // Get other user's current public key (SM-01: through the TOFU pin chokepoint)
-        const theirPublicKeyB64 = await this._getPinnedPeerKey(otherUserId);
-        if (!theirPublicKeyB64) {
-            throw new Error('Other user has no public key - they may not have set up encryption yet');
-        }
-
-        // Get our keys
         const ourKeys = await KeyStorageService.getIdentityKeys(this.currentUserId);
         if (!ourKeys) {
             throw new Error('No local identity keys - run device pairing first');
         }
-        // ECDH key agreement
-        const theirPublicKey = CryptoPrimitivesService.deserializeKey(theirPublicKeyB64);
-        const sharedSecret = CryptoPrimitivesService.deriveSharedSecret(ourKeys.secretKey, theirPublicKey);
 
-        // Derive session key (always epoch 0)
-        const sessionKey = await KeyDerivationService.deriveSessionKey(sharedSecret, epoch);
+        if (inboundPreamble) {
+            // ---------- RESPONDER (Bob) ----------
+            console.log(`[KeyManagementService] establishSession: RESPONDER bootstrap conv=${conversationId}`);
 
-        // Store locally
-        await KeyStorageService.storeSessionKey(conversationId, epoch, sessionKey, 0);
+            // TOFU-pin the initiator's Ed25519 signing key (§2.4): once pinned, a
+            // later change is warned about (same policy as the X25519 pin).
+            if (inboundPreamble.ikSignPub) {
+                await this._pinPeerSignKey(otherUserId, inboundPreamble.ikSignPub);
+            }
 
-        // Backup to database using the session backup key
-        if (this._sessionBackupKey) {
-            await KeyBackupService.backupSessionKey(
-                this.currentUserId,
-                conversationId,
-                sessionKey,
-                epoch,
-                this._sessionBackupKey
-            );
-            console.log(`[KeyManagementService] establishSession: Session backed up to database`);
-        } else {
-            console.log(`[KeyManagementService] establishSession: No session backup key - session NOT backed up`);
+            // Our SPK keypair (Bob's first ratchet keypair IS his SPK keypair).
+            const spkId = inboundPreamble.spkId;
+            const spk = await KeyStorageService.getSignedPrekey(this.currentUserId, spkId);
+            if (!spk) {
+                throw new Error(`[KeyManagementService] No local signed prekey for spk_id=${spkId} - cannot bootstrap responder session`);
+            }
+
+            // OPK only if the initiator named one.
+            let opk = null;
+            if (inboundPreamble.opkId !== null && inboundPreamble.opkId !== undefined) {
+                opk = await KeyStorageService.getOneTimePrekey(this.currentUserId, inboundPreamble.opkId);
+                if (!opk) {
+                    throw new Error(`[KeyManagementService] No local one-time prekey for opk_id=${inboundPreamble.opkId}`);
+                }
+            }
+
+            const respRoot = await X3DHService.deriveResponderRoot({
+                identityKeyPair: ourKeys,
+                signedPrekeyPair: spk,
+                oneTimePrekeyPair: opk || undefined,
+                preamble: {
+                    ikPub: inboundPreamble.ikPub,
+                    ekPub: inboundPreamble.ekPub,
+                    opkId: (inboundPreamble.opkId !== undefined ? inboundPreamble.opkId : null)
+                }
+            });
+
+            const state = await DoubleRatchetService.ratchetInitBob(respRoot.SK, spk);
+            await KeyStorageService.putRatchetState(conversationId, state);
+
+            // Stash the X3DH AD (IK_a||IK_b) so the FIRST inbound message decrypt can
+            // bind the same AD the initiator used. Consumed by decryptMessage once.
+            this._pendingResponderAD = this._pendingResponderAD || {};
+            this._pendingResponderAD[String(conversationId)] = respRoot.associatedData;
+
+            // Consume the OPK locally (one-time use): delete its secret + best-effort
+            // delete the published public row (own-row DELETE is allowed by RLS).
+            if (opk && inboundPreamble.opkId !== null && inboundPreamble.opkId !== undefined) {
+                await KeyStorageService.deleteOneTimePrekey(this.currentUserId, inboundPreamble.opkId);
+                this._deletePublishedOpk(inboundPreamble.opkId).catch(() => {});
+                // Top the pool back up if it ran low.
+                this._replenishOneTimePrekeys().catch((e) =>
+                    console.warn('[KeyManagementService] OPK replenish after consume failed:', e.message));
+            }
+
+            return { ratchetReady: true, role: 'responder' };
         }
 
-        console.log(`[KeyManagementService] establishSession: Session created for conv=${conversationId}`);
+        // ---------- INITIATOR (Alice) ----------
+        console.log(`[KeyManagementService] establishSession: INITIATOR bootstrap conv=${conversationId}`);
 
-        return {
-            sessionKey,
-            epoch: epoch,
-            counter: 0
+        const peerBundle = await this._claimPeerBundle(otherUserId);
+
+        // TOFU-pin the peer's Ed25519 signing key BEFORE we trust its SPK signature.
+        await this._pinPeerSignKey(otherUserId, peerBundle._identitySignPubB64);
+
+        // deriveInitiatorRoot verifies the SPK signature FIRST (fail closed).
+        const init = await X3DHService.deriveInitiatorRoot({
+            identityKeyPair: ourKeys,
+            peerBundle
+        });
+
+        const state = await DoubleRatchetService.ratchetInitAlice(init.SK, peerBundle.signedPrekeyPub);
+        await KeyStorageService.putRatchetState(conversationId, state);
+
+        // Build the on-the-wire X3DH preamble for the FIRST message. x3dhService
+        // returns ikSignPub:null (initiator doesn't sign in X3DH); fill our OWN
+        // Ed25519 signing pub so the responder can TOFU-pin it (§2.4).
+        const signKeys = await this._getIdentitySignKeyPair();
+        const x3dhPreamble = {
+            ikPub:     init.preamble.ikPub,
+            ikSignPub: CryptoPrimitivesService.serializeKey(signKeys.publicKey),
+            ekPub:     init.preamble.ekPub,
+            spkId:     init.preamble.spkId,
+            opkId:     init.preamble.opkId
         };
+
+        // Stash the preamble + the X3DH associated data (IK_a||IK_b) so
+        // encryptMessage attaches the preamble to message 0 only and binds the
+        // SAME AD the responder will recompute.
+        this._pendingX3dhPreamble = this._pendingX3dhPreamble || {};
+        this._pendingX3dhPreamble[String(conversationId)] = x3dhPreamble;
+        this._pendingX3dhAD = this._pendingX3dhAD || {};
+        this._pendingX3dhAD[String(conversationId)] = init.associatedData;
+
+        return { ratchetReady: true, role: 'initiator', x3dhPreamble };
+    },
+
+    /**
+     * Pin (TOFU) a peer's Ed25519 IK_sig signing key. First contact pins; a later
+     * change dispatches a one-shot `peerSignKeyChanged` warning (do NOT block) and
+     * re-pins, mirroring the X25519 _getPinnedPeerKey policy. The pinned key is
+     * stored under a "sign:" namespaced userId in the existing pinned_keys store.
+     * @private
+     */
+    async _pinPeerSignKey(otherUserId, signPubB64) {
+        if (!signPubB64) return;
+        const pinId = 'sign:' + otherUserId;
+        const fp = CryptoPrimitivesService.getKeyFingerprint(
+            CryptoPrimitivesService.deserializeKey(signPubB64)
+        );
+        const pinned = await KeyStorageService.getPinnedKey(pinId);
+        if (!pinned) {
+            await KeyStorageService.pinKey(pinId, signPubB64, fp);
+            return;
+        }
+        if (pinned.publicKey === signPubB64) {
+            return;
+        }
+        if (pinned.lastWarnedFingerprint !== fp) {
+            if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+                window.dispatchEvent(new CustomEvent('peerSignKeyChanged', {
+                    detail: { userId: otherUserId, oldFingerprint: pinned.fingerprint, newFingerprint: fp }
+                }));
+            }
+            await KeyStorageService.updatePinnedWarn(pinId, fp);
+        }
+        await KeyStorageService.pinKey(pinId, signPubB64, fp);
+    },
+
+    /**
+     * Best-effort delete of a consumed OPK's published public row. The claim RPC
+     * already marks it consumed server-side (so it can't be re-claimed); this is
+     * housekeeping. Failure is non-fatal.
+     * @private
+     */
+    async _deletePublishedOpk(keyId) {
+        const opkTable = this._config?.tables?.oneTimePrekeys || 'one_time_prekeys';
+        try {
+            await this._database.queryDelete(opkTable, { user_id: this.currentUserId, key_id: keyId });
+        } catch (e) { /* non-fatal */ }
     },
 
     /**
@@ -808,59 +1137,81 @@ const KeyManagementService = {
     MAX_COUNTER: Number.MAX_SAFE_INTEGER - 1000,
 
     /**
-     * Encrypt a message
-     * @param {number|string} conversationId - Conversation ID
-     * @param {string} plaintext - Message to encrypt
-     * @returns {Promise<Object>} { ciphertext, nonce, counter, epoch }
+     * Encrypt a message via the Double Ratchet (FORWARD_SECRECY_DESIGN §3.4).
+     *
+     * Advances the SENDING chain, persists the advanced ratchet state atomically,
+     * and emits the ratchet header (ratchet_pub / prev_chain_len / msg_num). On the
+     * FIRST outbound message of an initiator-bootstrapped conversation it also emits
+     * the X3DH preamble (consumed once, then cleared) and binds AD = IK_a||IK_b into
+     * the AEAD.
+     *
+     * The per-message key is returned (`_messageKey`) so the caller can ARCHIVE it
+     * keyed by the message id once the insert returns that id (§5). It is NOT
+     * persisted here because the id is unknown until after the DB insert.
+     *
+     * @param {number|string} conversationId
+     * @param {string} plaintext
+     * @returns {Promise<Object>} {
+     *   ciphertext, nonce,
+     *   header:{ ratchet_pub, prev_chain_len, msg_num },
+     *   x3dhPreamble?:{ ikPub, ikSignPub, ekPub, spkId, opkId },
+     *   _messageKey: Uint8Array,        // for the sender-side archive
+     *   counter, epoch                  // vestigial back-compat (counter = msg_num)
+     * }
      */
     async encryptMessage(conversationId, plaintext) {
         if (!this.initialized) {
             throw new Error('[KeyManagementService] Not initialized');
         }
 
-        // Always use epoch 0
-        const epoch = 0;
-        const session = await KeyStorageService.getSessionKey(conversationId, epoch);
-        if (!session) {
-            throw new Error('No session - call establishSession first');
+        const state = await KeyStorageService.getRatchetState(conversationId);
+        if (!state) {
+            throw new Error('No ratchet session - call establishSession first');
         }
 
-        // Check for counter overflow
-        if (session.counter >= this.MAX_COUNTER) {
-            console.error(`[KeyManagementService] Counter overflow: ${session.counter}`);
-            throw new Error('Message counter overflow');
+        // Attach the X3DH preamble ONLY on the first message of an initiator
+        // conversation (msg_num 0 in the very first sending chain).
+        const convKey = String(conversationId);
+        const pending = this._pendingX3dhPreamble && this._pendingX3dhPreamble[convKey];
+        const isFirst = !!pending && state.Ns === 0 && state.PN === 0;
+
+        // On the first message, bind AD = IK_a_pub || IK_b_pub (matches the X3DH AD)
+        // so a tampered identity in the preamble fails the AEAD. The AD was computed
+        // by x3dhService.deriveInitiatorRoot and stashed in establishSession.
+        let adBytes;
+        if (isFirst) {
+            adBytes = this._pendingX3dhAD && this._pendingX3dhAD[convKey];
         }
 
-        // Derive message-specific key
-        const messageKey = await KeyDerivationService.deriveMessageKey(
-            session.sessionKey,
-            epoch,
-            session.counter
-        );
+        const plaintextBytes = CryptoPrimitivesService.encodeUTF8(plaintext);
+        const enc = await DoubleRatchetService.ratchetEncrypt(state, plaintextBytes, adBytes);
 
-        // Encrypt
-        const encrypted = CryptoPrimitivesService.encrypt(plaintext, messageKey);
-        const counter = session.counter;
+        // Persist the advanced state atomically (chain advanced, MK consumed).
+        await KeyStorageService.putRatchetState(conversationId, enc.newState);
 
-        // Increment counter
-        await KeyStorageService.incrementCounter(conversationId, epoch);
-
-        // Update backup counter
-        if (this._sessionBackupKey) {
-            await KeyBackupService.updateSessionCounter(
-                this.currentUserId,
-                conversationId,
-                epoch,
-                counter + 1
-            );
-        }
-
-        return {
-            ciphertext: encrypted.ciphertext,
-            nonce: encrypted.nonce,
-            counter: counter,
-            epoch: epoch
+        const result = {
+            ciphertext: enc.ciphertext,
+            nonce: enc.nonce,
+            header: {
+                ratchet_pub: enc.wireHeader.dh,
+                prev_chain_len: enc.wireHeader.pn,
+                msg_num: enc.wireHeader.n
+            },
+            _messageKey: enc.messageKey,
+            // Vestigial back-compat fields so any caller reading .counter/.epoch
+            // still gets a sane value (counter == msg_num within the chain).
+            counter: enc.wireHeader.n,
+            epoch: 0
         };
+
+        if (isFirst) {
+            result.x3dhPreamble = pending;
+            // Consume the stashed preamble + AD (only message 0 carries them).
+            delete this._pendingX3dhPreamble[convKey];
+            if (this._pendingX3dhAD) delete this._pendingX3dhAD[convKey];
+        }
+
+        return result;
     },
 
     /**
@@ -879,101 +1230,227 @@ const KeyManagementService = {
     },
 
     /**
-     * Decrypt a message
-     * @param {number|string} conversationId - Conversation ID
-     * @param {Object} encryptedData - { ciphertext, nonce, counter, epoch }
-     * @param {string} senderId - Sender's user ID
-     * @param {string} recipientId - Recipient's user ID (optional, for decrypting own messages)
-     * @returns {Promise<string>} Decrypted plaintext
+     * Sentinel rendered for a pre-cutover (static-ECDH) message that carries no
+     * ratchet header. Clean break (FORWARD_SECRECY_DESIGN §7): such rows are
+     * UNAVAILABLE, not an error.
      */
-    async decryptMessage(conversationId, encryptedData, senderId, recipientId = null) {
+    LEGACY_MESSAGE_SENTINEL: '[Message from a previous encryption version — unavailable]',
+
+    /**
+     * Decrypt a message via the Double Ratchet (FORWARD_SECRECY_DESIGN §5/§6).
+     *
+     * TWO PATHS, one entry point:
+     *   - HISTORY RE-RENDER (batch getMessages, options.liveAdvance !== true):
+     *     ARCHIVE-ONLY. Look up the per-message key by msg id and open directly;
+     *     NEVER advance the live ratchet (the ratchet is strictly ordered and its
+     *     keys are deleted after use, so replaying it over history is impossible).
+     *     A miss returns the unavailable sentinel rather than corrupting the ratchet.
+     *   - REALTIME ARRIVAL (options.liveAdvance === true): advance the live ratchet
+     *     (ratchetDecrypt, which also consumes/handles skipped keys), persist the
+     *     advanced state, then ARCHIVE the consumed key by msg id so all later
+     *     history renders read it from the archive.
+     *
+     * Responder bootstrap: when there is no ratchet yet AND the message header
+     * carries an X3DH preamble, establishSession (responder) is run first.
+     *
+     * Clean break: a message with no ratchet header (pre-cutover) renders the
+     * LEGACY_MESSAGE_SENTINEL, never throws.
+     *
+     * @param {number|string} conversationId
+     * @param {Object} encryptedData - {
+     *     ciphertext, nonce, id,
+     *     header:{ ratchet_pub, prev_chain_len, msg_num },
+     *     x3dhPreamble?:{ ikPub, ikSignPub, ekPub, spkId, opkId },
+     *     _messageKey?  // sender-side archive shortcut (own outbound message)
+     *   }
+     * @param {string} senderId
+     * @param {string} recipientId
+     * @param {Object} [options] - { liveAdvance:boolean } (true = realtime path)
+     * @returns {Promise<string>} plaintext (or the legacy sentinel)
+     */
+    async decryptMessage(conversationId, encryptedData, senderId, recipientId = null, options = {}) {
         if (!this.initialized) {
             throw new Error('[KeyManagementService] Not initialized');
         }
 
-        const { ciphertext, nonce, counter } = encryptedData;
-        const epoch = 0;
+        const { ciphertext, nonce, id: messageId, header, x3dhPreamble } = encryptedData;
+        const liveAdvance = options && options.liveAdvance === true;
 
-        if (typeof counter !== 'number' || counter < 0 || !Number.isInteger(counter)) {
-            throw new Error(`Invalid counter value: ${counter}`);
+        // ---------- 1) ARCHIVE-FIRST (order-independent, parallel-safe) ----------
+        // Both paths consult the archive first; the batch path NEVER goes past it.
+        if (messageId !== undefined && messageId !== null) {
+            const archivedKey = await KeyStorageService.getDecryptedMessageKey(messageId);
+            if (archivedKey) {
+                return await this._openWithMessageKey(ciphertext, nonce, header, x3dhPreamble, archivedKey, conversationId, senderId, recipientId);
+            }
         }
 
-        // Determine other user for ECDH derivation
+        // ---------- 2) Clean break: no ratchet header => legacy row ----------
+        if (!header || !header.ratchet_pub) {
+            return this.LEGACY_MESSAGE_SENTINEL;
+        }
+
+        // ---------- 3) Sender-side own message archive shortcut ----------
+        // When WE sent this message, encryptMessage handed us the message key; the
+        // caller passes it back as _messageKey so we archive + render without
+        // touching the receive ratchet (we never decrypt our own send chain).
+        if (encryptedData._messageKey) {
+            const mk = encryptedData._messageKey;
+            const pt = await this._openWithMessageKey(ciphertext, nonce, header, x3dhPreamble, mk, conversationId, senderId, recipientId);
+            if (messageId !== undefined && messageId !== null) {
+                await KeyStorageService.putDecryptedMessageKey(messageId, mk, conversationId);
+            }
+            return pt;
+        }
+
+        // ---------- 4) BATCH path on an archive miss: do NOT advance the ratchet ----------
+        if (!liveAdvance) {
+            // Order-/parallel-unsafe to advance here. Surface as unavailable; the
+            // realtime path is responsible for the first (ratchet-ordered) mint.
+            return '[Cannot decrypt - sign out and sign back in to restore keys]';
+        }
+
+        // ---------- 5) REALTIME path: advance the live ratchet ----------
         const otherUserId = senderId === this.currentUserId ? recipientId : senderId;
         if (!otherUserId) {
-            throw new Error('Cannot determine other user for ECDH - recipientId not provided');
+            throw new Error('Cannot determine other user - recipientId not provided');
         }
 
-        // Get or derive session key
-        let session = await KeyStorageService.getSessionKey(conversationId, epoch);
-        let usedCachedSession = !!session;
-
-        if (!session) {
-            session = await this._deriveSessionFromHistory(conversationId, otherUserId);
-        }
-        if (!session) {
-            throw new Error('Cannot decrypt - no session key available');
-        }
-
-        // Derive message key and attempt to decrypt
-        const messageKey = await KeyDerivationService.deriveMessageKey(session.sessionKey, epoch, counter);
-
-        let plaintext;
-        try {
-            plaintext = CryptoPrimitivesService.decrypt(ciphertext, nonce, messageKey);
-        } catch (authFailure) {
-            // SM-24: do NOT silently rebuild the session and swallow auth failures.
-            // The single allowed retry is a genuine stale-cache repair: re-derive
-            // ONCE from history (which routes through _getPinnedPeerKey, so a server
-            // key swap has already been warned about) and retry ONLY if the freshly
-            // derived session key actually differs from the cached one. Otherwise the
-            // failure is real tampering/corruption and we throw a typed error.
-            if (usedCachedSession) {
-                const freshSession = await this._deriveSessionFromHistory(conversationId, otherUserId);
-
-                const sessionKeyChanged = freshSession &&
-                    !CryptoPrimitivesService.constantTimeEqual(freshSession.sessionKey, session.sessionKey);
-
-                if (sessionKeyChanged) {
-                    const retryKey = await KeyDerivationService.deriveMessageKey(freshSession.sessionKey, epoch, counter);
-                    try {
-                        plaintext = CryptoPrimitivesService.decrypt(ciphertext, nonce, retryKey);
-                        // Adopt the repaired session for subsequent messages.
-                        session = freshSession;
-                    } catch (retryFailure) {
-                        throw this._decryptionError('authentication failed', 'message');
-                    }
-                } else {
-                    // No different session to try - real tamper/auth failure.
-                    // Note: we do NOT delete the cached session here; deleting it was
-                    // pure masking and forced a needless re-derive on every load.
-                    throw this._decryptionError('authentication failed', 'message');
-                }
-            } else {
-                throw this._decryptionError('authentication failed', 'message');
+        // Responder bootstrap on the FIRST inbound message carrying an X3DH preamble.
+        let state = await KeyStorageService.getRatchetState(conversationId);
+        let responderAD = null;
+        if (!state) {
+            if (!x3dhPreamble) {
+                // No ratchet and no bootstrap header — cannot establish a session.
+                throw this._decryptionError('no session', 'message');
             }
+            await this.establishSession(conversationId, otherUserId, x3dhPreamble);
+            state = await KeyStorageService.getRatchetState(conversationId);
+            responderAD = this._pendingResponderAD && this._pendingResponderAD[String(conversationId)];
         }
 
-        // SM-10: replay high-water mark — ADVANCE-ONLY here (must not reject).
-        // decryptMessage is invoked for FULL HISTORY re-decryption on every conversation
-        // open (newest-first, in parallel via Promise.all). Rejecting counter < last would
-        // therefore reject legitimate older history after the newest message advanced the
-        // mark — breaking the round trip. So here we only track the per-sender high-water
-        // mark (best-effort, never blocking). Strict at-most-once rejection of a freshly
-        // REPLAYED message must be enforced on the realtime single-message arrival path,
-        // not in batch history decryption (tracked as a follow-up).
+        // AD for the first inbound (bootstrap) message: bind IK_a||IK_b exactly as
+        // the initiator did. For all later messages AD is undefined.
+        let adBytes;
+        if (x3dhPreamble) {
+            adBytes = responderAD || (this._pendingResponderAD && this._pendingResponderAD[String(conversationId)]);
+        }
+
+        const wireHeader = {
+            dh: header.ratchet_pub,
+            pn: header.prev_chain_len | 0,
+            n: header.msg_num | 0
+        };
+
+        let dec;
+        try {
+            dec = await DoubleRatchetService.ratchetDecrypt(state, wireHeader, nonce, ciphertext, adBytes);
+        } catch (authFailure) {
+            throw this._decryptionError('authentication failed', 'message');
+        }
+
+        // Persist the advanced ratchet state (chain advanced, skipped keys updated).
+        await KeyStorageService.putRatchetState(conversationId, dec.newState);
+
+        // Consume the one-shot responder AD now that the bootstrap message decrypted.
+        if (x3dhPreamble && this._pendingResponderAD) {
+            delete this._pendingResponderAD[String(conversationId)];
+        }
+
+        // ARCHIVE the consumed key by message id (§5) so history re-renders read it
+        // from the archive and never advance the live ratchet again.
+        if (messageId !== undefined && messageId !== null) {
+            await KeyStorageService.putDecryptedMessageKey(messageId, dec.messageKey, conversationId);
+        }
+
+        // SM-10: best-effort replay high-water mark (never blocks a decrypt).
         if (senderId !== this.currentUserId) {
             try {
-                const last = await KeyStorageService.getLastCounter(conversationId, epoch, senderId);
-                if (counter > last) {
-                    await KeyStorageService.setLastCounter(conversationId, epoch, senderId, counter);
+                const last = await KeyStorageService.getLastCounter(conversationId, 0, senderId);
+                if (wireHeader.n > last) {
+                    await KeyStorageService.setLastCounter(conversationId, 0, senderId, wireHeader.n);
                 }
-            } catch (e) {
-                // Counter bookkeeping must never block a successful decryption.
-            }
+            } catch (e) { /* bookkeeping must not block */ }
         }
 
-        return plaintext;
+        return CryptoPrimitivesService.decodeUTF8(dec.plaintext);
+    },
+
+    /**
+     * Archive a SENDER-side per-message key once the message id is known (§5).
+     * Called by messagingService.sendMessage right after the insert returns the id.
+     * Lets OUR OWN getMessages history re-render read the message from the archive
+     * (we never run the receive ratchet over our own send chain).
+     * @param {number|string} conversationId
+     * @param {number|string} messageId
+     * @param {Uint8Array} messageKey
+     */
+    async archiveSentMessageKey(conversationId, messageId, messageKey) {
+        if (!this.initialized) {
+            throw new Error('[KeyManagementService] Not initialized');
+        }
+        await KeyStorageService.putDecryptedMessageKey(messageId, messageKey, conversationId);
+    },
+
+    /**
+     * Open a ciphertext with a known message key, reconstructing the same AEAD
+     * header/AD binding DoubleRatchetService used at encrypt time. Used by the
+     * archive-hit path (history re-render) and the sender-side own-message path,
+     * neither of which touches the live ratchet.
+     * @private
+     */
+    async _openWithMessageKey(ciphertext, nonce, header, x3dhPreamble, messageKey, conversationId, senderId, recipientId) {
+        const wireHeader = {
+            dh: header.ratchet_pub,
+            pn: header.prev_chain_len | 0,
+            n: header.msg_num | 0
+        };
+        const drHeader = { dh: CryptoPrimitivesService.deserializeKey(wireHeader.dh), pn: wireHeader.pn, n: wireHeader.n };
+
+        // Reconstruct AD only for a bootstrap (first) message. The AD is IK_a||IK_b;
+        // recompute it from the preamble's ikPub + our/peer identity as appropriate.
+        let adBytes;
+        if (x3dhPreamble) {
+            adBytes = await this._reconstructAD(x3dhPreamble, senderId, recipientId);
+        }
+
+        const encKey = await DoubleRatchetService.deriveAeadKey(messageKey, drHeader, adBytes);
+        const ct = CryptoPrimitivesService.deserializeKey(ciphertext);
+        const nn = CryptoPrimitivesService.deserializeKey(nonce);
+        const pt = CryptoPrimitivesService.nacl.secretbox.open(ct, nn, encKey);
+        if (!pt) {
+            throw this._decryptionError('authentication failed', 'message');
+        }
+        return CryptoPrimitivesService.decodeUTF8(pt);
+    },
+
+    /**
+     * Reconstruct AD = IK_a_pub || IK_b_pub for a bootstrap message, where IK_a is
+     * the INITIATOR identity (preamble.ikPub) and IK_b is the RESPONDER identity.
+     * We resolve which side is which from senderId: the sender of a bootstrap
+     * message is always the initiator (IK_a = preamble.ikPub), and the responder
+     * (IK_b) is the OTHER party's pinned X25519 identity key.
+     * @private
+     */
+    async _reconstructAD(x3dhPreamble, senderId, recipientId) {
+        const ikA = CryptoPrimitivesService.deserializeKey(x3dhPreamble.ikPub); // initiator IK
+        // Responder = the recipient of the bootstrap message. If we are the
+        // recipient, IK_b is OUR identity; else it is the recipient's pinned key.
+        let ikBb64;
+        if (recipientId === this.currentUserId || senderId !== this.currentUserId) {
+            // We are the responder (recipient) — IK_b is our own identity public.
+            const ourKeys = await KeyStorageService.getIdentityKeys(this.currentUserId);
+            ikBb64 = CryptoPrimitivesService.serializeKey(ourKeys.publicKey);
+        } else {
+            // We are the initiator re-rendering our own sent bootstrap — IK_b is the
+            // peer (recipient) pinned key.
+            ikBb64 = await this._getPinnedPeerKey(recipientId);
+        }
+        const ikB = CryptoPrimitivesService.deserializeKey(ikBb64);
+        const ad = new Uint8Array(ikA.length + ikB.length);
+        ad.set(ikA, 0);
+        ad.set(ikB, ikA.length);
+        return ad;
     },
 
     /**
@@ -1061,10 +1538,20 @@ const KeyManagementService = {
     },
 
     /**
-     * Get the session key for a conversation
-     * Used by AttachmentService for file encryption
+     * Get a stable per-conversation symmetric key for ATTACHMENT encryption.
+     * Used by AttachmentService.
+     *
+     * The static-ECDH session_keys store is no longer populated (the Double Ratchet
+     * replaced it), so we derive a deterministic attachment key from the ratchet's
+     * shared ROOT key (RK) via HKDF. Both parties share RK after X3DH bootstrap, so
+     * both derive the SAME attachment key; it is bound to a fixed info string so it
+     * never collides with ratchet message keys. NOTE: this attachment key is stable
+     * for the life of the ratchet root (it does NOT per-attachment forward-secret —
+     * attachment FS is out of scope for S5/S6; tracked as future work), but it is
+     * still rooted in the X3DH/ratchet secret, not the long-term identity.
+     *
      * @param {number|string} conversationId - Conversation ID
-     * @returns {Promise<Uint8Array|null>} Session key or null if not available
+     * @returns {Promise<Uint8Array|null>} 32-byte attachment key or null
      */
     async getSessionKey(conversationId) {
         if (!this.initialized) {
@@ -1072,16 +1559,17 @@ const KeyManagementService = {
             return null;
         }
 
-        // Always use epoch 0
-        const epoch = 0;
-        const session = await KeyStorageService.getSessionKey(conversationId, epoch);
-
-        if (session && session.sessionKey) {
-            return session.sessionKey;
+        const state = await KeyStorageService.getRatchetState(conversationId);
+        if (!state || !state.RK) {
+            console.warn(`[KeyManagementService] getSessionKey: No ratchet session for conversation ${conversationId}`);
+            return null;
         }
 
-        console.warn(`[KeyManagementService] getSessionKey: No session found for conversation ${conversationId}`);
-        return null;
+        // Attachment key = HKDF(ikm=RK, info="MoneyTracker:Attachment:v1", salt=RK).
+        // Explicit non-empty salt bypasses the context-salt fallback deterministically.
+        return await KeyDerivationService._hkdf(
+            state.RK, 'MoneyTracker:Attachment:v1', 32, state.RK
+        );
     },
 
     /**
@@ -1342,41 +1830,6 @@ const KeyManagementService = {
         } catch (error) {
             console.error('[KeyManagementService] Failed to sync partner keys:', error);
         }
-    },
-
-    /**
-     * Derive session key from historical public key
-     * @private
-     * @param {number|string} conversationId - Conversation ID
-     * @param {string} otherUserId - Other user's ID
-     * @returns {Promise<Object|null>} { sessionKey, epoch, counter } or null
-     */
-    async _deriveSessionFromHistory(conversationId, otherUserId) {
-        console.log(`[KeyManagementService] Deriving session for conv=${conversationId}`);
-
-        // SM-01: resolve the peer key through the TOFU pin chokepoint.
-        const theirPublicKeyB64 = await this._getPinnedPeerKey(otherUserId);
-        if (!theirPublicKeyB64) {
-            console.error('[KeyManagementService] No public key for peer');
-            return null;
-        }
-
-        const ourKeys = await KeyStorageService.getIdentityKeys(this.currentUserId);
-        if (!ourKeys) {
-            console.error('[KeyManagementService] No local identity keys available');
-            return null;
-        }
-
-        // ECDH key agreement
-        const theirPublicKey = CryptoPrimitivesService.deserializeKey(theirPublicKeyB64);
-        const sharedSecret = CryptoPrimitivesService.deriveSharedSecret(ourKeys.secretKey, theirPublicKey);
-        const sessionKey = await KeyDerivationService.deriveSessionKey(sharedSecret, 0);
-
-        // Cache for future use
-        await KeyStorageService.storeSessionKey(conversationId, 0, sessionKey, 0);
-        console.log(`[KeyManagementService] Session derived and cached for conv=${conversationId}`);
-
-        return { sessionKey, epoch: 0, counter: 0 };
     },
 
     /**

@@ -32,11 +32,12 @@ const KeyStorageService = {
         this._config = config;
 
         const dbName = config?.indexedDB?.name || 'MoneyTrackerEncryption';
-        // Default bumped to 2 (S4): the ratchet-persistence stores ship at v2.
-        // onupgradeneeded is strictly ADDITIVE (every createObjectStore is guarded
-        // by `if (!contains)`), so an existing v1 DB upgrades in place without
-        // dropping identity_keys / session_keys / etc.
-        const dbVersion = config?.indexedDB?.version || 2;
+        // Default bumped to 3 (S5): the X3DH prekey-secret store ships at v3, on top
+        // of the v2 ratchet-persistence stores. onupgradeneeded is strictly ADDITIVE
+        // (every createObjectStore is guarded by `if (!contains)`), so an existing
+        // v1/v2 DB upgrades in place without dropping identity_keys / session_keys /
+        // ratchet_states / etc.
+        const dbVersion = config?.indexedDB?.version || 3;
 
         console.log(`[KeyStorageService] Opening IndexedDB: ${dbName} v${dbVersion}`);
 
@@ -158,6 +159,20 @@ const KeyStorageService = {
                     });
                     archiveStore.createIndex('conversationId', 'conversationId', { unique: false });
                     console.log('[KeyStorageService] Created decrypted_message_keys store');
+                }
+
+                // ===== S5: X3DH prekey SECRETS (FORWARD_SECRECY_DESIGN §2) =====
+                // The signed-prekey (SPK) and one-time-prekey (OPK) SECRET keypairs
+                // the responder needs to recompute the X3DH DHs when an inbound
+                // bootstrap names a given spk_id / opk_id. Only PUBLIC material is
+                // published to the server; these secrets stay local, WRAPPED at rest.
+                // keyPath ['userId','kind','keyId'] -> kind is 'spk' | 'opk'.
+                if (!db.objectStoreNames.contains('prekey_secrets')) {
+                    const prekeyStore = db.createObjectStore('prekey_secrets', {
+                        keyPath: ['userId', 'kind', 'keyId']
+                    });
+                    prekeyStore.createIndex('userKind', ['userId', 'kind'], { unique: false });
+                    console.log('[KeyStorageService] Created prekey_secrets store');
                 }
 
                 console.log('[KeyStorageService] Database schema upgrade complete');
@@ -1264,6 +1279,136 @@ const KeyStorageService = {
         });
     },
 
+    // ==================== Prekey Secrets (S5, X3DH §2) ====================
+    //
+    // SPK + OPK SECRET keypairs, WRAPPED at rest with the SM-02 wrap key. Only the
+    // PUBLIC material is published to the server; these never leave the device in
+    // the clear. The responder reads these by id when an inbound X3DH bootstrap
+    // names a spk_id / opk_id.
+
+    /**
+     * Persist a prekey keypair secret (wrapped) keyed by (userId, kind, keyId).
+     * @private
+     * @param {string} userId
+     * @param {'spk'|'opk'} kind
+     * @param {number} keyId
+     * @param {{publicKey:Uint8Array, secretKey:Uint8Array}} keyPair
+     */
+    async _putPrekeySecret(userId, kind, keyId, keyPair) {
+        this._ensureInitialized();
+        // Wrap publicKey||secretKey as one blob; both are X25519 32-byte halves.
+        const pub = keyPair.publicKey;
+        const sec = keyPair.secretKey;
+        const joined = new Uint8Array(pub.length + sec.length);
+        joined.set(pub, 0);
+        joined.set(sec, pub.length);
+        const { wrapped, iv } = await this._wrapSecret(joined);
+        const record = {
+            userId, kind, keyId: keyId | 0,
+            pubLen: pub.length,
+            wrappedKeyPair: wrapped,
+            wrapIv: iv,
+            createdAt: new Date().toISOString()
+        };
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('prekey_secrets', 'readwrite');
+            const store = tx.objectStore('prekey_secrets');
+            const request = store.put(record);
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    },
+
+    /**
+     * Load + unwrap a prekey keypair secret.
+     * @private
+     * @returns {Promise<{publicKey:Uint8Array, secretKey:Uint8Array}|null>}
+     */
+    async _getPrekeySecret(userId, kind, keyId) {
+        this._ensureInitialized();
+        const record = await new Promise((resolve, reject) => {
+            const tx = this.db.transaction('prekey_secrets', 'readonly');
+            const store = tx.objectStore('prekey_secrets');
+            const request = store.get([userId, kind, keyId | 0]);
+            request.onsuccess = () => resolve(request.result || null);
+            request.onerror = () => reject(request.error);
+        });
+        if (!record || !record.wrappedKeyPair || !record.wrapIv) {
+            return null;
+        }
+        const joined = await this._unwrapSecret(record.wrappedKeyPair, record.wrapIv);
+        const pubLen = record.pubLen || 32;
+        return {
+            publicKey: joined.slice(0, pubLen),
+            secretKey: joined.slice(pubLen)
+        };
+    },
+
+    /** Persist the user's signed-prekey secret keyed by spkId. */
+    async putSignedPrekey(userId, spkId, keyPair) {
+        return this._putPrekeySecret(userId, 'spk', spkId, keyPair);
+    },
+
+    /** Load the user's signed-prekey secret by spkId (or null). */
+    async getSignedPrekey(userId, spkId) {
+        return this._getPrekeySecret(userId, 'spk', spkId);
+    },
+
+    /**
+     * The id of the most-recently-stored signed prekey for the user, or null.
+     * (Used to avoid re-minting an SPK on every login.)
+     */
+    async getCurrentSignedPrekeyId(userId) {
+        this._ensureInitialized();
+        const rows = await this._getPrekeySecretsByKind(userId, 'spk');
+        if (!rows.length) return null;
+        return rows.reduce((max, r) => (r.keyId > max ? r.keyId : max), rows[0].keyId);
+    },
+
+    /** Persist a one-time-prekey secret keyed by keyId. */
+    async putOneTimePrekey(userId, keyId, keyPair) {
+        return this._putPrekeySecret(userId, 'opk', keyId, keyPair);
+    },
+
+    /** Load a one-time-prekey secret by keyId (or null). */
+    async getOneTimePrekey(userId, keyId) {
+        return this._getPrekeySecret(userId, 'opk', keyId);
+    },
+
+    /** Delete a one-time-prekey secret (consume-once after a session bootstrap). */
+    async deleteOneTimePrekey(userId, keyId) {
+        this._ensureInitialized();
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('prekey_secrets', 'readwrite');
+            const store = tx.objectStore('prekey_secrets');
+            const request = store.delete([userId, 'opk', keyId | 0]);
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    },
+
+    /** The current max OPK keyId for the user (0 if none) — for id assignment. */
+    async getMaxOneTimePrekeyId(userId) {
+        const rows = await this._getPrekeySecretsByKind(userId, 'opk');
+        if (!rows.length) return 0;
+        return rows.reduce((max, r) => (r.keyId > max ? r.keyId : max), 0);
+    },
+
+    /**
+     * All prekey-secret records of a given kind for a user (raw records).
+     * @private
+     */
+    async _getPrekeySecretsByKind(userId, kind) {
+        this._ensureInitialized();
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('prekey_secrets', 'readonly');
+            const index = tx.objectStore('prekey_secrets').index('userKind');
+            const request = index.getAll([userId, kind]);
+            request.onsuccess = () => resolve(request.result || []);
+            request.onerror = () => reject(request.error);
+        });
+    },
+
     // ==================== Database Management ====================
 
     /**
@@ -1280,7 +1425,8 @@ const KeyStorageService = {
         // wrap_keys — the per-profile wrap key is reused across re-init/restore).
         const stores = [
             'identity_keys', 'session_keys', 'historical_keys', 'pinned_keys', 'recv_counters',
-            'ratchet_states', 'skipped_message_keys', 'decrypted_message_keys'
+            'ratchet_states', 'skipped_message_keys', 'decrypted_message_keys',
+            'prekey_secrets'
         ];
 
         for (const storeName of stores) {
