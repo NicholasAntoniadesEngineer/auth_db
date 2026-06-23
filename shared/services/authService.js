@@ -546,8 +546,23 @@ const AuthService = {
 
             const trimmedEmail = email.trim();
 
-            if (password.length < 8) {
-                return { success: false, error: 'Password must be at least 8 characters', user: null, requiresEmailVerification: false };
+            // H-2: enforce the strong-password policy BEFORE any account is
+            // created. The account password encrypts the at-rest identity-key
+            // backup (PBKDF2-SHA256 + AES-256-GCM), so a weak password makes a
+            // leaked backup offline-brute-forceable (total E2E break). This is
+            // the single source of truth (PasswordCryptoService); the previous
+            // length>=8-only gate was insufficient and is replaced here.
+            const PasswordCrypto = (typeof window !== 'undefined' && window.PasswordCryptoService)
+                || (typeof PasswordCryptoService !== 'undefined' ? PasswordCryptoService : null);
+            if (PasswordCrypto && typeof PasswordCrypto.enforcePasswordStrength === 'function') {
+                try {
+                    PasswordCrypto.enforcePasswordStrength(password);
+                } catch (strengthError) {
+                    return { success: false, error: strengthError.message, user: null, requiresEmailVerification: false };
+                }
+            } else if (password.length < 12) {
+                // Fail closed to the raised minimum if the crypto service is unavailable.
+                return { success: false, error: 'Password must be at least 12 characters', user: null, requiresEmailVerification: false };
             }
 
             const { data, error } = await this.client.auth.signUp({
@@ -1052,6 +1067,21 @@ const AuthService = {
         try {
             if (!this.client) {
                 return { success: false, error: 'Auth service not initialized' };
+            }
+
+            // H-2: the new password will re-encrypt the identity-key backup, so
+            // it must satisfy the same strong-password policy as signup before
+            // we commit the change. Single source of truth: PasswordCryptoService.
+            const PasswordCrypto = (typeof window !== 'undefined' && window.PasswordCryptoService)
+                || (typeof PasswordCryptoService !== 'undefined' ? PasswordCryptoService : null);
+            if (PasswordCrypto && typeof PasswordCrypto.enforcePasswordStrength === 'function') {
+                try {
+                    PasswordCrypto.enforcePasswordStrength(newPassword);
+                } catch (strengthError) {
+                    return { success: false, error: strengthError.message };
+                }
+            } else if (!newPassword || newPassword.length < 12) {
+                return { success: false, error: 'Password must be at least 12 characters' };
             }
 
             console.log('[AuthService] Updating user password');

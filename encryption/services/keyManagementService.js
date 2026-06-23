@@ -1079,11 +1079,15 @@ const KeyManagementService = {
             // ---------- RESPONDER (Bob) ----------
             console.log(`[KeyManagementService] establishSession: RESPONDER bootstrap conv=${conversationId}`);
 
-            // TOFU-pin the initiator's Ed25519 signing key (§2.4): once pinned, a
-            // later change is warned about (same policy as the X25519 pin).
-            if (inboundPreamble.ikSignPub) {
-                await this._pinPeerSignKey(otherUserId, inboundPreamble.ikSignPub);
-            }
+            // H-1 (fail-closed): resolve + AUTHENTICATE the initiator's X25519 IK
+            // BEFORE any DH. Returns the TRUSTED X25519 ikPub (pinned/published, NOT
+            // the raw wire value) and atomically co-pins (X25519 IK, Ed25519 IK_sig)
+            // on genuine first contact. THROWS PeerIdentityChangedError on a swapped
+            // ikPub (or a pinned-IK_sig-with-unpinned/mismatched-ikPub bootstrap), so
+            // NO SK is derived and NO ratchet is persisted against a forged identity.
+            const trustedIkPubB64 = await this._resolveResponderPeerIdentity(
+                otherUserId, inboundPreamble.ikPub, inboundPreamble.ikSignPub
+            );
 
             // Our SPK keypair (Bob's first ratchet keypair IS his SPK keypair).
             const spkId = inboundPreamble.spkId;
@@ -1106,7 +1110,11 @@ const KeyManagementService = {
                 signedPrekeyPair: spk,
                 oneTimePrekeyPair: opk || undefined,
                 preamble: {
-                    ikPub: inboundPreamble.ikPub,
+                    // Use the TRUSTED (pinned/published) X25519 IK, NEVER the raw wire
+                    // value, so both the DH and the AD (IK_a||IK_b) bind the AUTHENTIC
+                    // initiator identity. trustedIkPubB64 == inboundPreamble.ikPub here
+                    // (it was byte-equal-checked above) — this is belt-and-suspenders.
+                    ikPub: trustedIkPubB64,
                     ekPub: inboundPreamble.ekPub,
                     opkId: (inboundPreamble.opkId !== undefined ? inboundPreamble.opkId : null)
                 }
@@ -1248,6 +1256,121 @@ const KeyManagementService = {
             newFingerprint: fp,
             keyType: 'sign'
         });
+    },
+
+    /**
+     * H-1 (HIGH) — RESPONDER-side X25519 identity authentication + atomic IK↔IK_sig
+     * co-pinning. Closes the peer-impersonation hole where the responder branch
+     * trusted an UNPINNED, UNSIGNED initiator X25519 IK from the wire while pinning
+     * only the Ed25519 IK_sig — letting a hostile server/peer plant a bootstrap with
+     * Alice's genuine IK_sig + an attacker X25519 ikPub and derive a working session
+     * "from Alice".
+     *
+     * Policy (FAIL CLOSED — no SK derived / no ratchet persisted on any rejection):
+     *
+     *  1. Resolve the peer's AUTHENTIC X25519 IK via _getPinnedPeerKey(otherUserId)
+     *     (TOFU chokepoint; it already THROWS PeerIdentityChangedError if the peer's
+     *     PUBLISHED X25519 key diverged from a prior pin).
+     *
+     *  2. If a pin/published X25519 IK exists, REQUIRE the wire ikPub to byte-equal
+     *     it. A mismatch is the swapped-IK attack -> throw keyType:'identity'.
+     *
+     *  3. Already-pinned-IK_sig variant: the IK↔IK_sig pins are BOUND. IK_sig is the
+     *     deterministic IK_sign for the X25519 secret (HKDF(secret, info, salt=pub))
+     *     and CANNOT be recomputed from the public X25519 alone — so the soundest
+     *     binding is to require the SAME (ikPub, ikSignPub) PAIR to be pinned
+     *     together: if an IK_sig is already pinned for this peer, an X25519 IK pin
+     *     MUST also exist and the wire ikPub MUST match it. This rejects a bootstrap
+     *     that presents a pinned IK_sig with a non-matching / unpinned ikPub even if
+     *     the published X25519 key were unavailable.
+     *
+     *  4. Genuine first contact (no pin, no published key): TOFU-pin the WIRE ikPub
+     *     as the X25519 IK so the safety number reflects what was actually bound.
+     *
+     *  5. ATOMIC co-pin: the X25519 IK pin and the Ed25519 IK_sig pin are only ever
+     *     established TOGETHER. We refuse to set one without the other — _pinPeerSignKey
+     *     (which may THROW on a changed IK_sig) is called FIRST so a sign-key change
+     *     aborts before any X25519 pin is written; the X25519 pin is written LAST,
+     *     only after every check (incl. IK_sig) has passed.
+     *
+     * @private
+     * @param {string} otherUserId - peer (sender) user id
+     * @param {string} wireIkPubB64 - the initiator X25519 IK from inboundPreamble.ikPub
+     * @param {string} [wireIkSignPubB64] - the initiator Ed25519 IK_sig from inboundPreamble.ikSignPub
+     * @returns {Promise<string>} the TRUSTED X25519 ikPub (b64) to bind into DH + AD
+     * @throws {PeerIdentityChangedError} on a swapped/forged identity (no SK, no ratchet)
+     */
+    async _resolveResponderPeerIdentity(otherUserId, wireIkPubB64, wireIkSignPubB64) {
+        if (!wireIkPubB64) {
+            throw new Error('[KeyManagementService] responder bootstrap missing initiator X25519 ikPub');
+        }
+
+        // Existing pins (X25519 IK + Ed25519 IK_sig) for this peer.
+        const pinnedIk = await KeyStorageService.getPinnedKey(otherUserId);
+        const signPinId = this._signPinId(otherUserId);
+        const pinnedSign = await KeyStorageService.getPinnedKey(signPinId);
+
+        const fpOf = (b64) => CryptoPrimitivesService.getKeyFingerprint(
+            CryptoPrimitivesService.deserializeKey(b64)
+        );
+
+        // (3) BOUND-PAIR check FIRST: a pinned IK_sig with NO pinned X25519 IK means
+        // the two pins are not co-set — refuse rather than trust the wire ikPub.
+        // (Normal operation always co-pins, so this only fires on tampering.)
+        if (pinnedSign && !pinnedIk) {
+            throw this._peerIdentityChangedError({
+                userId: otherUserId,
+                oldFingerprint: pinnedSign.fingerprint,
+                newFingerprint: fpOf(wireIkPubB64),
+                keyType: 'identity'
+            });
+        }
+
+        // (2) If the X25519 IK is already pinned, the wire ikPub MUST match it byte
+        // for byte. This is the core H-1 check — it blocks the swapped-ikPub attack
+        // even when the attacker supplies Alice's genuine IK_sig.
+        if (pinnedIk && pinnedIk.publicKey !== wireIkPubB64) {
+            throw this._peerIdentityChangedError({
+                userId: otherUserId,
+                oldFingerprint: pinnedIk.fingerprint,
+                newFingerprint: fpOf(wireIkPubB64),
+                keyType: 'identity'
+            });
+        }
+
+        // (1) Cross-check against the PUBLISHED X25519 IK through the TOFU chokepoint.
+        // _getPinnedPeerKey THROWS if the published key diverged from a prior pin, and
+        // on genuine first contact it pins the published key. It returns null only
+        // when the peer has published no X25519 key at all.
+        const publishedIk = await this._getPinnedPeerKey(otherUserId);
+        if (publishedIk && publishedIk !== wireIkPubB64) {
+            // The wire ikPub disagrees with the peer's authentic published key.
+            throw this._peerIdentityChangedError({
+                userId: otherUserId,
+                oldFingerprint: fpOf(publishedIk),
+                newFingerprint: fpOf(wireIkPubB64),
+                keyType: 'identity'
+            });
+        }
+
+        // ----- All identity checks passed; ATOMIC co-pin (5) -----
+        // IK_sig FIRST: a CHANGED IK_sig throws here (before we write any X25519 pin),
+        // and first-contact pins it (TOFU). Refuse to proceed without an IK_sig so the
+        // two pins are never set independently.
+        if (!wireIkSignPubB64) {
+            throw new Error('[KeyManagementService] responder bootstrap missing initiator Ed25519 ikSignPub (cannot atomically bind identity)');
+        }
+        await this._pinPeerSignKey(otherUserId, wireIkSignPubB64);
+
+        // X25519 IK LAST: if _getPinnedPeerKey already pinned it (published-key path),
+        // pinnedIk-or-published covers it; otherwise this is the pure-first-contact
+        // path with no published key — TOFU-pin the wire ikPub so the safety number
+        // reflects what was actually bound (4).
+        if (!pinnedIk && !publishedIk) {
+            await KeyStorageService.pinKey(otherUserId, wireIkPubB64, fpOf(wireIkPubB64));
+        }
+
+        return wireIkPubB64;
     },
 
     /**
@@ -1598,24 +1721,90 @@ const KeyManagementService = {
      * @private
      */
     async _reconstructAD(x3dhPreamble, senderId, recipientId) {
-        const ikA = CryptoPrimitivesService.deserializeKey(x3dhPreamble.ikPub); // initiator IK
-        // Responder = the recipient of the bootstrap message. If we are the
-        // recipient, IK_b is OUR identity; else it is the recipient's pinned key.
+        // H-1 (responder path): AD = IK_a||IK_b must bind the AUTHENTIC initiator
+        // identity, NOT the raw wire ikPub. When we are the responder, resolve IK_a
+        // (the sender's X25519 IK) through the pin chokepoint and require the wire
+        // ikPub to match it (fail-closed) before building AD; only fall back to the
+        // wire value on genuine first contact (no pin, no published key), exactly as
+        // _resolveResponderPeerIdentity does at bootstrap.
+        const weAreResponder = (recipientId === this.currentUserId || senderId !== this.currentUserId);
+
+        let ikAb64 = x3dhPreamble.ikPub; // initiator IK (wire value by default)
         let ikBb64;
-        if (recipientId === this.currentUserId || senderId !== this.currentUserId) {
-            // We are the responder (recipient) — IK_b is our own identity public.
+        if (weAreResponder) {
+            // We are the responder (recipient) — authenticate the sender's IK_a, and
+            // IK_b is OUR own identity public.
+            ikAb64 = await this._resolveADInitiatorKey(senderId, x3dhPreamble.ikPub);
             const ourKeys = await KeyStorageService.getIdentityKeys(this.currentUserId);
             ikBb64 = CryptoPrimitivesService.serializeKey(ourKeys.publicKey);
         } else {
-            // We are the initiator re-rendering our own sent bootstrap — IK_b is the
-            // peer (recipient) pinned key.
+            // We are the initiator re-rendering our own sent bootstrap — IK_a is our
+            // own preamble value (already authentic), IK_b is the peer (recipient)
+            // pinned key.
             ikBb64 = await this._getPinnedPeerKey(recipientId);
         }
+        const ikA = CryptoPrimitivesService.deserializeKey(ikAb64); // initiator IK
         const ikB = CryptoPrimitivesService.deserializeKey(ikBb64);
         const ad = new Uint8Array(ikA.length + ikB.length);
         ad.set(ikA, 0);
         ad.set(ikB, ikA.length);
         return ad;
+    },
+
+    /**
+     * H-1 (responder AD path) — resolve the AUTHENTIC initiator (sender) X25519 IK
+     * for AD reconstruction and require the wire ikPub to match it. READ-ONLY: it
+     * never pins/re-pins (this runs on the archive/history re-render path too, where
+     * a legitimately accepted rotation must still re-render and we must not re-trip
+     * the fail-closed pin logic). Mirrors _resolveResponderPeerIdentity's matching
+     * rules without the bootstrap-time mutations.
+     *
+     *  - If the sender's X25519 IK is pinned: require wireIkPub == pinned, else THROW
+     *    (the swapped-IK forgery). Use the pinned value for AD.
+     *  - Else, cross-check the PUBLISHED X25519 IK (read-only): if present and it
+     *    disagrees with the wire ikPub, THROW.
+     *  - Genuine first contact (no pin, no published key): fall back to the wire ikPub
+     *    (this is the same value bootstrap TOFU-pinned, so AD stays consistent).
+     *
+     * @private
+     * @param {string} senderId - the bootstrap message sender (the initiator)
+     * @param {string} wireIkPubB64 - x3dhPreamble.ikPub from the wire
+     * @returns {Promise<string>} the TRUSTED initiator X25519 ikPub (b64)
+     * @throws {PeerIdentityChangedError} on a mismatch (forged AD identity)
+     */
+    async _resolveADInitiatorKey(senderId, wireIkPubB64) {
+        const fpOf = (b64) => CryptoPrimitivesService.getKeyFingerprint(
+            CryptoPrimitivesService.deserializeKey(b64)
+        );
+
+        const pinnedIk = await KeyStorageService.getPinnedKey(senderId);
+        if (pinnedIk) {
+            if (pinnedIk.publicKey !== wireIkPubB64) {
+                throw this._peerIdentityChangedError({
+                    userId: senderId,
+                    oldFingerprint: pinnedIk.fingerprint,
+                    newFingerprint: fpOf(wireIkPubB64),
+                    keyType: 'identity'
+                });
+            }
+            return pinnedIk.publicKey;
+        }
+
+        // No pin yet — cross-check the published key WITHOUT mutating any pin.
+        let publishedIk = null;
+        try {
+            publishedIk = await HistoricalKeysService.getCurrentKey(senderId);
+        } catch (e) { /* read-only best effort */ }
+        if (publishedIk && publishedIk !== wireIkPubB64) {
+            throw this._peerIdentityChangedError({
+                userId: senderId,
+                oldFingerprint: fpOf(publishedIk),
+                newFingerprint: fpOf(wireIkPubB64),
+                keyType: 'identity'
+            });
+        }
+        // First contact: the wire ikPub is what bootstrap TOFU-pinned.
+        return wireIkPubB64;
     },
 
     /**

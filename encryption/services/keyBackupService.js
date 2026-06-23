@@ -69,10 +69,31 @@ const KeyBackupService = {
      * @param {string} password - User's backup password
      * @returns {Promise<Object>} { success: boolean, recoveryKey?: string, sessionBackupKey?: Uint8Array }
      */
+    /**
+     * H-2 guard: refuse to derive a backup key from a weak password.
+     *
+     * This is the last line of defence so NO caller can persist a
+     * password-encrypted identity backup (PBKDF2-SHA256 + AES-256-GCM) under a
+     * password weak enough to be offline-brute-forced from a leaked/at-rest DB.
+     * The UI/auth layers also enforce this, but the policy lives in
+     * PasswordCryptoService.enforcePasswordStrength (single source of truth).
+     * @private
+     * @param {string} password
+     */
+    _assertStrongBackupPassword(password) {
+        if (typeof PasswordCryptoService !== 'undefined'
+            && typeof PasswordCryptoService.enforcePasswordStrength === 'function') {
+            PasswordCryptoService.enforcePasswordStrength(password);
+        }
+    },
+
     async createIdentityBackup(userId, secretKey, password) {
         if (!this._database) {
             throw new Error('[KeyBackupService] No database - cannot create backup');
         }
+
+        // H-2: never encrypt the identity backup under a weak password.
+        this._assertStrongBackupPassword(password);
 
         console.log('[KeyBackupService] Creating identity key backup...');
 
@@ -137,6 +158,9 @@ const KeyBackupService = {
             throw new Error('[KeyBackupService] No database - cannot create backup');
         }
 
+        // H-2: never encrypt the identity backup under a weak password.
+        this._assertStrongBackupPassword(password);
+
         console.log('[KeyBackupService] Creating identity key backup with provided recovery key...');
 
         // Encrypt identity key with password
@@ -197,6 +221,9 @@ const KeyBackupService = {
         if (!this._database) {
             throw new Error('[KeyBackupService] No database - cannot create backup');
         }
+
+        // H-2: never encrypt the identity backup under a weak password.
+        this._assertStrongBackupPassword(password);
 
         console.log('[KeyBackupService] Creating password-only identity key backup...');
 

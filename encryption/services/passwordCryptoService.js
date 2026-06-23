@@ -266,7 +266,36 @@ const PasswordCryptoService = {
     },
 
     /**
-     * Validate password strength
+     * Minimum account-password length.
+     *
+     * This password encrypts the at-rest identity-key backup
+     * (PBKDF2-SHA256 600k + AES-256-GCM, see encryptToBase64 / KeyBackupService).
+     * A weak password makes a leaked/at-rest backup offline-brute-forceable,
+     * which is a total E2E break (SECURITY_AUDIT.md finding H-2). Raised from 8
+     * to 12 as the load-bearing mitigation; this is the single source of truth
+     * for the minimum length and is consumed by validatePasswordStrength /
+     * enforcePasswordStrength.
+     */
+    MIN_PASSWORD_LENGTH: 12,
+
+    /**
+     * Number of distinct character classes (lower / upper / digit / symbol)
+     * a password must contain to be considered strong.
+     */
+    MIN_CHARACTER_CLASSES: 3,
+
+    /**
+     * Validate password strength.
+     *
+     * Policy (H-2): a password is valid only if it is at least
+     * MIN_PASSWORD_LENGTH characters AND draws on at least
+     * MIN_CHARACTER_CLASSES of the four character classes
+     * (lowercase, uppercase, digit, symbol).
+     *
+     * TODO (H-2 deeper hardening, not yet implemented): integrate a strength
+     * estimator (e.g. zxcvbn) and a breached-password (k-anonymity / HIBP)
+     * check so high-frequency-but-policy-passing passwords are also rejected.
+     *
      * @param {string} password - Password to validate
      * @returns {Object} { valid: boolean, score: number, feedback: string[] }
      */
@@ -274,35 +303,63 @@ const PasswordCryptoService = {
         const feedback = [];
         let score = 0;
 
-        if (password.length >= 8) score++;
-        else feedback.push('Password should be at least 8 characters');
+        password = typeof password === 'string' ? password : '';
 
-        if (password.length >= 12) score++;
+        const minLength = this.MIN_PASSWORD_LENGTH;
 
-        if (/[a-z]/.test(password)) score++;
+        if (password.length >= minLength) score++;
+        else feedback.push(`Password should be at least ${minLength} characters`);
+
+        // Reward extra length for the strength score (does not gate validity).
+        if (password.length >= minLength + 4) score++;
+
+        let characterClasses = 0;
+
+        if (/[a-z]/.test(password)) { score++; characterClasses++; }
         else feedback.push('Add lowercase letters');
 
-        if (/[A-Z]/.test(password)) score++;
+        if (/[A-Z]/.test(password)) { score++; characterClasses++; }
         else feedback.push('Add uppercase letters');
 
-        if (/[0-9]/.test(password)) score++;
+        if (/[0-9]/.test(password)) { score++; characterClasses++; }
         else feedback.push('Add numbers');
 
-        if (/[^a-zA-Z0-9]/.test(password)) score++;
+        if (/[^a-zA-Z0-9]/.test(password)) { score++; characterClasses++; }
         else feedback.push('Add special characters');
 
         return {
-            valid: score >= 4 && password.length >= 8,
+            valid: password.length >= minLength && characterClasses >= this.MIN_CHARACTER_CLASSES,
             score: score,
+            characterClasses: characterClasses,
             feedback: feedback
         };
     },
 
     /**
-     * Enforce password strength requirements
-     * Throws an error if password does not meet minimum requirements
+     * Enforce password strength requirements.
+     *
+     * This is the SINGLE SOURCE OF TRUTH for the account-password policy and
+     * MUST be called before the password-encrypted identity backup is created
+     * (signup) and whenever the account password changes (reset). Throws if the
+     * password is too weak so the caller never derives a backup key from it.
+     *
+     * SECURITY_AUDIT.md finding H-2 — deeper hardening still TODO (documented,
+     * not yet implemented; tracked separately so the wiring/length fix can land
+     * now):
+     *   - TODO(H-2): migrate the backup KDF from PBKDF2-SHA256 (encryptToBase64
+     *     in this file) to memory-hard Argon2id, which dramatically raises the
+     *     cost of the offline brute force this finding describes.
+     *   - TODO(H-2): mix in a server-unknown KDF pepper so an at-rest/leaked DB
+     *     read alone cannot mount the offline attack without the (separately
+     *     held) pepper.
+     *   - TODO(H-2): prefer the high-entropy recovery key as the PRIMARY backup
+     *     escrow and treat the password-encrypted backup as a convenience copy,
+     *     so backup security no longer hinges on human password entropy. (Gated
+     *     on RECOVERY_KEY_BYTES being restored to 32 — a separate decision.)
+     *
      * @param {string} password - Password to validate
      * @throws {Error} If password is too weak
+     * @returns {Object} The validation result when the password is acceptable
      */
     enforcePasswordStrength(password) {
         const validation = this.validatePasswordStrength(password);
