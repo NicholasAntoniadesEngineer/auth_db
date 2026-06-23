@@ -1623,6 +1623,11 @@ const DatabaseService = {
             } else {
                 console.log(`[DatabaseService] Filtering user_months by user_id: ${currentUserId}`);
             }
+
+            // S5: bootstrap/load the budget DEK before any transformMonthFromDatabase
+            // runs, so encrypted (enc_version=1) rows can be decrypted. Fail closed —
+            // an unbootstrappable DEK propagates rather than returning blanked budgets.
+            await this._ensureBudgetDekForUser(currentUserId);
             
             // First, do a diagnostic query to check if ANY data exists (just count)
             if (currentUserId) {
@@ -2015,7 +2020,11 @@ const DatabaseService = {
                     console.log(`[DatabaseService] No authenticated user - skipping user_months query`);
                     return null;
                 }
-                
+
+                // S5: bootstrap/load the budget DEK before transformMonthFromDatabase
+                // runs on an own (possibly encrypted) row. Fail closed.
+                await this._ensureBudgetDekForUser(currentUserId);
+
                 const userFetchFilter = { year: year, month: month, user_id: currentUserId };
                 const userFetchResult = await this.querySelect(this._getTableName('userMonths'), {
                     select: '*',
@@ -2224,6 +2233,14 @@ const DatabaseService = {
                 }
             }
             
+            // S4: bootstrap/load the budget DEK before transformMonthToDatabase
+            // encrypts. Only for the per-user user_months table (userId set);
+            // example_months stays plaintext and needs no DEK. Fail closed — an
+            // unbootstrappable DEK propagates rather than writing plaintext.
+            if (userId) {
+                await this._ensureBudgetDekForUser(userId);
+            }
+
             const monthRecord = this.transformMonthToDatabase(monthData, year, month, userId);
             console.log(`[DatabaseService] Transformed month record:`, {
                 year: monthRecord.year,
@@ -2426,7 +2443,11 @@ const DatabaseService = {
             if (!currentUserId) {
                 return {};
             }
-            
+
+            // S5: bootstrap/load the budget DEK before transformPotFromDatabase runs,
+            // so encrypted pots decrypt. Fail closed.
+            await this._ensureBudgetDekForUser(currentUserId);
+
             const result = await this.querySelect('pots', {
                 select: '*',
                 filter: { user_id: currentUserId },
@@ -2501,11 +2522,19 @@ const DatabaseService = {
             }
             
             const potsArray = Object.values(potsData);
-            
+
             if (potsArray.length === 0) {
                 return true;
             }
-            
+
+            // S4: bootstrap/load the budget DEK before transformPotToDatabase encrypts.
+            // Pots are always per-user; fail closed if the DEK is unavailable.
+            const potsUserId = await this._getCurrentUserId();
+            if (!potsUserId) {
+                throw new Error('User not authenticated - cannot save pots without authentication');
+            }
+            await this._ensureBudgetDekForUser(potsUserId);
+
             const potsRecords = potsArray.map(pot => this.transformPotToDatabase(pot));
             
             console.log('[DatabaseService] Upserting pots...');
@@ -2737,26 +2766,151 @@ const DatabaseService = {
     },
     
     /**
+     * Resolve the BudgetKeyService (S2). In the browser it is a global; under node
+     * (the deterministic gates) it is wired onto global by the harness. Kept indirect
+     * so this submodule never bundles or hard-depends on the money_tracker service.
+     * @private
+     * @returns {Object} BudgetKeyService
+     */
+    _budgetKeyService() {
+        const bks = (typeof window !== 'undefined' && window.BudgetKeyService)
+            ? window.BudgetKeyService
+            : (typeof BudgetKeyService !== 'undefined' ? BudgetKeyService
+                : (typeof globalThis !== 'undefined' ? globalThis.BudgetKeyService : undefined));
+        if (!bks) {
+            throw new Error('[DatabaseService] BudgetKeyService is not available — cannot encrypt/decrypt budget data');
+        }
+        return bks;
+    },
+
+    /**
+     * Resolve the BudgetCryptoService (S1, the pure crypto wrapper). Same indirection
+     * rationale as _budgetKeyService.
+     * @private
+     * @returns {Object} BudgetCryptoService
+     */
+    _budgetCryptoService() {
+        const bcs = (typeof window !== 'undefined' && window.BudgetCryptoService)
+            ? window.BudgetCryptoService
+            : (typeof BudgetCryptoService !== 'undefined' ? BudgetCryptoService
+                : (typeof globalThis !== 'undefined' ? globalThis.BudgetCryptoService : undefined));
+        if (!bcs) {
+            throw new Error('[DatabaseService] BudgetCryptoService is not available — cannot encrypt/decrypt budget data');
+        }
+        return bcs;
+    },
+
+    /**
+     * Fetch the budget DEK loaded for this session, failing CLOSED.
+     *
+     * The budget read/write transforms (S4/S5) are synchronous and run after
+     * ensureBudgetDEK() has bound the session to one user at the load/save
+     * chokepoints (getAllMonths / getAllPots / saveMonth). This returns that single
+     * cached DEK. If no DEK is loaded it THROWS — the caller must never silently
+     * write or read plaintext for sensitive budget fields (design §3.3).
+     * @private
+     * @returns {Uint8Array} the 32-byte DEK
+     * @throws {Error} when the DEK is not loaded (fail closed)
+     */
+    _requireBudgetDek() {
+        return this._budgetKeyService().getLoadedDEK();
+    },
+
+    /**
+     * Bootstrap-or-load the budget DEK into the session cache for a user, so the
+     * synchronous read/write transforms can encrypt/decrypt. Idempotent: a no-op if
+     * the DEK is already cached for this user. Call at the budget load / save
+     * chokepoints (getAllMonths / getAllPots / saveMonth) BEFORE the transforms run.
+     *
+     * Fail-closed contract: a real failure (locked / unwrap failure / DB error)
+     * PROPAGATES so the caller does not proceed to read/write plaintext. Encryption
+     * is REQUIRED for the per-user budget tables.
+     * @private
+     * @param {string} userId
+     * @returns {Promise<void>}
+     */
+    async _ensureBudgetDekForUser(userId) {
+        if (!userId) return; // no authenticated user -> nothing to bootstrap (e.g. example-only view)
+        await this._budgetKeyService().ensureBudgetDEK(userId);
+    },
+
+    /**
      * Transform month data from database format to application format
      * @param {Object} dbRecord - Database record
      * @returns {Object} Application format month data
      */
     transformMonthFromDatabase(dbRecord) {
+        // ---- S5 dual-read: encrypted (enc_version >= 1) vs legacy plaintext (0/null) ----
+        // An encrypted row stores ALL seven sensitive fields inside enc_payload and
+        // leaves the legacy plaintext columns NULL. A legacy row (enc_version 0/absent,
+        // no enc_payload) is read exactly as before. This window lets old rows AND new
+        // rows render side by side during migration (design §3.2 / §6).
+        let sensitive;
+        if ((dbRecord.enc_version || 0) >= 1 && dbRecord.enc_payload) {
+            // Decrypt the single per-row blob. decryptBlob fails CLOSED on a wrong key
+            // or any tamper (Poly1305 auth failure) — it throws rather than returning
+            // garbage, so a decrypt failure surfaces a typed error and never silently
+            // blanks a budget (design §3.3). Wrap to make the failure attributable.
+            let dek;
+            try {
+                dek = this._requireBudgetDek();
+            } catch (keyErr) {
+                throw this._wrapBudgetDecryptError(keyErr, dbRecord, 'month');
+            }
+            try {
+                sensitive = this._budgetCryptoService().decryptBlob(
+                    { enc_payload: dbRecord.enc_payload, enc_nonce: dbRecord.enc_nonce, enc_version: dbRecord.enc_version },
+                    dek
+                );
+            } catch (decErr) {
+                throw this._wrapBudgetDecryptError(decErr, dbRecord, 'month');
+            }
+        } else {
+            sensitive = {
+                dateRange: dbRecord.date_range || {},
+                weeklyBreakdown: dbRecord.weekly_breakdown || [],
+                fixedCosts: dbRecord.fixed_costs || [],
+                variableCosts: dbRecord.variable_costs || [],
+                unplannedExpenses: dbRecord.unplanned_expenses || [],
+                incomeSources: dbRecord.income_sources || [],
+                pots: dbRecord.pots || []
+            };
+        }
+
         return {
             key: this.generateMonthKey(dbRecord.year, dbRecord.month),
             year: dbRecord.year,
             month: dbRecord.month,
             monthName: dbRecord.month_name || this.getMonthName(dbRecord.month),
-            dateRange: dbRecord.date_range || {},
-            weeklyBreakdown: dbRecord.weekly_breakdown || [],
-            fixedCosts: dbRecord.fixed_costs || [],
-            variableCosts: dbRecord.variable_costs || [],
-            unplannedExpenses: dbRecord.unplanned_expenses || [],
-            incomeSources: dbRecord.income_sources || [],
-            pots: dbRecord.pots || [],
+            dateRange: sensitive.dateRange || {},
+            weeklyBreakdown: sensitive.weeklyBreakdown || [],
+            fixedCosts: sensitive.fixedCosts || [],
+            variableCosts: sensitive.variableCosts || [],
+            unplannedExpenses: sensitive.unplannedExpenses || [],
+            incomeSources: sensitive.incomeSources || [],
+            pots: sensitive.pots || [],
             createdAt: dbRecord.created_at,
             updatedAt: dbRecord.updated_at
         };
+    },
+
+    /**
+     * Build a typed, attributable error for a budget decrypt/key failure so a
+     * failure surfaces loudly rather than silently blanking a budget (design §3.3).
+     * Preserves the underlying .code (e.g. DEK_NOT_LOADED) and message.
+     * @private
+     */
+    _wrapBudgetDecryptError(cause, dbRecord, kind) {
+        const where = kind === 'pot'
+            ? `pot ${dbRecord && dbRecord.id}`
+            : `month ${dbRecord && dbRecord.year}-${dbRecord && dbRecord.month}`;
+        const err = new Error(
+            `[DatabaseService] failed to decrypt ${where}: ${cause && cause.message ? cause.message : cause}`
+        );
+        err.name = 'BudgetDecryptError';
+        err.code = (cause && cause.code) ? cause.code : 'DEK_UNWRAP_FAILED';
+        err.cause = cause;
+        return err;
     },
     
     /**
@@ -2768,27 +2922,68 @@ const DatabaseService = {
      */
     transformMonthToDatabase(monthData, year, month, userId = null) {
         const now = new Date().toISOString();
-        
+
+        // Structural columns are ALWAYS plaintext (design §1.3): they drive RLS,
+        // ordering, upsert keys and sync. NOTHING financial lives here.
         const record = {
             year: year,
             month: month,
             month_name: monthData.monthName || this.getMonthName(month),
-            date_range: monthData.dateRange || {},
-            weekly_breakdown: monthData.weeklyBreakdown || [],
-            fixed_costs: monthData.fixedCosts || [],
-            variable_costs: monthData.variableCosts || [],
-            unplanned_expenses: monthData.unplannedExpenses || [],
-            income_sources: monthData.incomeSources || [],
-            pots: monthData.pots || [],
             updated_at: now,
             created_at: monthData.createdAt || now
         };
-        
-        // Include user_id only for user_months table
-        if (userId !== null) {
-            record.user_id = userId;
+
+        // example_months rows (userId === null) are NOT per-user owned, have no DEK,
+        // and are shared read-only seed data — they stay PLAINTEXT (enc_version 0).
+        // Only the per-user user_months table is encrypted.
+        if (userId === null) {
+            record.date_range = monthData.dateRange || {};
+            record.weekly_breakdown = monthData.weeklyBreakdown || [];
+            record.fixed_costs = monthData.fixedCosts || [];
+            record.variable_costs = monthData.variableCosts || [];
+            record.unplanned_expenses = monthData.unplannedExpenses || [];
+            record.income_sources = monthData.incomeSources || [];
+            record.pots = monthData.pots || [];
+            return record;
         }
-        
+
+        // ---- S4 encrypt-on-write (user_months) ----
+        // Bundle the SEVEN sensitive fields into one JSON, secretbox under the DEK,
+        // and emit ONLY the envelope. The legacy plaintext financial columns are
+        // OMITTED entirely (never written) — they are reset to NULL on update via the
+        // explicit nulling below, so an updated row carries no plaintext residue.
+        // FAIL CLOSED: _requireBudgetDek() throws if no DEK is loaded; we never fall
+        // back to writing plaintext (design §3.1 / §3.3).
+        const dek = this._requireBudgetDek();
+        const sensitive = {
+            dateRange: monthData.dateRange || {},
+            weeklyBreakdown: monthData.weeklyBreakdown || [],
+            fixedCosts: monthData.fixedCosts || [],
+            variableCosts: monthData.variableCosts || [],
+            unplannedExpenses: monthData.unplannedExpenses || [],
+            incomeSources: monthData.incomeSources || [],
+            pots: monthData.pots || []
+        };
+        const env = this._budgetCryptoService().encryptBlob(sensitive, dek);
+        record.enc_payload = env.enc_payload;
+        record.enc_nonce = env.enc_nonce;
+        record.enc_version = env.enc_version; // 1
+
+        // On UPDATE of a previously-legacy row, NULL the seven plaintext JSONB
+        // columns so no cleartext financial data lingers alongside the ciphertext
+        // (task S4: "write NULL/skip them"; design §6 step 3). NULL (not an empty
+        // default) is unambiguous "no plaintext value" — it both clears residue on a
+        // PATCH and keeps the no-financial-plaintext lint clean. The S6 batch
+        // migration of untouched legacy rows is separate and NOT done here.
+        record.date_range = null;
+        record.weekly_breakdown = null;
+        record.fixed_costs = null;
+        record.variable_costs = null;
+        record.unplanned_expenses = null;
+        record.income_sources = null;
+        record.pots = null;
+
+        record.user_id = userId;
         return record;
     },
     
@@ -2798,6 +2993,36 @@ const DatabaseService = {
      * @returns {Object} Application format pot data
      */
     transformPotFromDatabase(dbRecord) {
+        // ---- S5 dual-read (pots): encrypted vs legacy plaintext ----
+        if ((dbRecord.enc_version || 0) >= 1 && dbRecord.enc_payload) {
+            let dek;
+            try {
+                dek = this._requireBudgetDek();
+            } catch (keyErr) {
+                throw this._wrapBudgetDecryptError(keyErr, dbRecord, 'pot');
+            }
+            let s;
+            try {
+                s = this._budgetCryptoService().decryptBlob(
+                    { enc_payload: dbRecord.enc_payload, enc_nonce: dbRecord.enc_nonce, enc_version: dbRecord.enc_version },
+                    dek
+                );
+            } catch (decErr) {
+                throw this._wrapBudgetDecryptError(decErr, dbRecord, 'pot');
+            }
+            return {
+                id: dbRecord.id,
+                name: s.name || '',
+                estimatedAmount: s.estimatedAmount || 0,
+                actualAmount: s.actualAmount || 0,
+                comments: s.comments || '',
+                createdAt: dbRecord.created_at,
+                updatedAt: dbRecord.updated_at
+            };
+        }
+
+        // Legacy plaintext (enc_version 0/absent): read the typed columns EXACTLY as
+        // before — byte-identical to the pre-S5 behavior.
         return {
             id: dbRecord.id,
             name: dbRecord.name,
@@ -2816,13 +3041,32 @@ const DatabaseService = {
      */
     transformPotToDatabase(potData) {
         const now = new Date().toISOString();
-        
+
+        // ---- S4 encrypt-on-write (pots) ----
+        // Bundle the four sensitive fields into one JSON, secretbox under the DEK,
+        // emit ONLY the envelope, and NULL the typed plaintext columns so no cleartext
+        // money/name/notes linger. FAIL CLOSED: _requireBudgetDek() throws if no DEK
+        // is loaded — never fall back to writing plaintext (design §3.1 / §3.3).
+        const dek = this._requireBudgetDek();
+        const sensitive = {
+            name: potData.name || '',
+            estimatedAmount: potData.estimatedAmount || 0,
+            actualAmount: potData.actualAmount || 0,
+            comments: potData.comments || ''
+        };
+        const env = this._budgetCryptoService().encryptBlob(sensitive, dek);
+
         return {
             id: potData.id || undefined,
-            name: potData.name || '',
-            estimated_amount: potData.estimatedAmount || 0,
-            actual_amount: potData.actualAmount || 0,
-            comments: potData.comments || '',
+            // Sensitive typed columns are NULLed (no plaintext value emitted). name is
+            // nullable post-S3 (apply-budget-envelope.sql relaxed its NOT NULL).
+            name: null,
+            estimated_amount: null,
+            actual_amount: null,
+            comments: null,
+            enc_payload: env.enc_payload,
+            enc_nonce: env.enc_nonce,
+            enc_version: env.enc_version, // 1
             updated_at: now,
             created_at: potData.createdAt || now
         };
