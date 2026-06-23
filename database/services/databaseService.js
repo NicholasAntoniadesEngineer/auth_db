@@ -627,6 +627,25 @@ const DatabaseService = {
             }
             
             return result;
+        } else if (options.onConflict) {
+            // True PostgREST upsert: when the caller declares a conflict target
+            // (e.g. { onConflict: 'user_id' }), re-publishing an existing row must
+            // MERGE rather than insert-only — otherwise it collides with the PRIMARY
+            // KEY and fails 23505/409. Used by SPK rotation re-publish, identity-key
+            // self-heal, and the rotation-lock acquire.
+            const upsertUrl = new URL(`${this.client.supabaseUrl}/rest/v1/${table}`);
+            upsertUrl.searchParams.append('on_conflict', options.onConflict);
+            // _getAuthHeaders() already sets Prefer: 'return=representation'; override
+            // it to also merge duplicates so the POST upserts instead of insert-only.
+            const upsertHeaders = this._getAuthHeaders();
+            upsertHeaders['Prefer'] = 'resolution=merge-duplicates,return=representation';
+            const response = await fetch(upsertUrl.toString(), {
+                method: 'POST',
+                headers: upsertHeaders,
+                body: JSON.stringify(data)
+            });
+
+            return await this._handleResponse(response);
         } else {
             // Simple POST for new records
             const postUrl = new URL(`${this.client.supabaseUrl}/rest/v1/${table}`);
@@ -635,7 +654,7 @@ const DatabaseService = {
                 headers: this._getAuthHeaders(),
                 body: JSON.stringify(data)
             });
-            
+
             return await this._handleResponse(response);
         }
     },
@@ -1845,12 +1864,24 @@ const DatabaseService = {
                                     for (const monthRecord of ownerMonthsResult.data) {
                                         const monthKey = this.generateMonthKey(monthRecord.year, monthRecord.month);
                                         if (!monthsObject[monthKey]) {
-                                            const transformedMonth = this.transformMonthFromDatabase(monthRecord);
+                                            // H11 resilience: an owner's row is encrypted with the
+                                            // OWNER's DEK, which a recipient cannot unwrap, so the
+                                            // transform may throw BudgetDecryptError. Skip the one
+                                            // bad shared month instead of aborting the whole loop
+                                            // (the user's own months still load). Full cross-user
+                                            // sharing crypto is a later step (S7).
+                                            let transformedMonth;
+                                            try {
+                                                transformedMonth = this.transformMonthFromDatabase(monthRecord);
+                                            } catch (decryptError) {
+                                                console.warn(`[DatabaseService] Skipping undecryptable shared month (all data) ${monthKey} from user ${share.owner_user_id}:`, decryptError.message);
+                                                continue;
+                                            }
                                             transformedMonth.isShared = true;
                                             transformedMonth.sharedOwnerId = share.owner_user_id;
                                             transformedMonth.sharedAccessLevel = share.access_level;
                                             transformedMonth.sharedOwnerEmail = ownerEmail;
-                                            
+
                                             monthsObject[monthKey] = transformedMonth;
                                             console.log(`[DatabaseService] Added shared month (all data): ${monthKey} from user ${share.owner_user_id} (${ownerEmail})`);
                                         }
@@ -1893,12 +1924,21 @@ const DatabaseService = {
                                                 
                                                 if (sharedMonthResult.data && sharedMonthResult.data.length > 0) {
                                                     const monthRecord = sharedMonthResult.data[0];
-                                                    const transformedMonth = this.transformMonthFromDatabase(monthRecord);
+                                                    // H11 resilience: skip an undecryptable shared month
+                                                    // (owner's DEK, not the recipient's) rather than
+                                                    // aborting the whole shared-months loop.
+                                                    let transformedMonth;
+                                                    try {
+                                                        transformedMonth = this.transformMonthFromDatabase(monthRecord);
+                                                    } catch (decryptError) {
+                                                        console.warn(`[DatabaseService] Skipping undecryptable shared month ${monthKey} from user ${share.owner_user_id}:`, decryptError.message);
+                                                        continue;
+                                                    }
                                                     transformedMonth.isShared = true;
                                                     transformedMonth.sharedOwnerId = share.owner_user_id;
                                                     transformedMonth.sharedAccessLevel = share.access_level;
                                                     transformedMonth.sharedOwnerEmail = ownerEmail; // Use pre-fetched email
-                                                    
+
                                                     monthsObject[monthKey] = transformedMonth;
                                                     console.log(`[DatabaseService] Added shared month: ${monthKey} from user ${share.owner_user_id} (${ownerEmail})`);
                                                 }
@@ -1922,12 +1962,21 @@ const DatabaseService = {
                                         
                                         if (sharedMonthResult.data && sharedMonthResult.data.length > 0) {
                                             const monthRecord = sharedMonthResult.data[0];
-                                            const transformedMonth = this.transformMonthFromDatabase(monthRecord);
+                                            // H11 resilience: skip an undecryptable shared month
+                                            // (owner's DEK, not the recipient's) rather than
+                                            // aborting the whole shared-months loop.
+                                            let transformedMonth;
+                                            try {
+                                                transformedMonth = this.transformMonthFromDatabase(monthRecord);
+                                            } catch (decryptError) {
+                                                console.warn(`[DatabaseService] Skipping undecryptable shared month ${monthKey} from user ${share.owner_user_id}:`, decryptError.message);
+                                                continue;
+                                            }
                                             transformedMonth.isShared = true;
                                             transformedMonth.sharedOwnerId = share.owner_user_id;
                                             transformedMonth.sharedAccessLevel = share.access_level;
                                             transformedMonth.sharedOwnerEmail = ownerEmail; // Use pre-fetched email
-                                            
+
                                             monthsObject[monthKey] = transformedMonth;
                                             console.log(`[DatabaseService] Added shared month: ${monthKey} from user ${share.owner_user_id} (${ownerEmail})`);
                                         }
@@ -2484,7 +2533,18 @@ const DatabaseService = {
                                 
                                 if (sharedPotsResult.data && Array.isArray(sharedPotsResult.data)) {
                                     sharedPotsResult.data.forEach(pot => {
-                                        const transformedPot = this.transformPotFromDatabase(pot);
+                                        // H11 resilience: an owner's pot is encrypted with the
+                                        // OWNER's DEK, which the recipient cannot unwrap, so the
+                                        // transform may throw BudgetDecryptError. Skip the one bad
+                                        // shared pot instead of aborting all shared pots (the
+                                        // user's own pots still load). S7 covers cross-user crypto.
+                                        let transformedPot;
+                                        try {
+                                            transformedPot = this.transformPotFromDatabase(pot);
+                                        } catch (decryptError) {
+                                            console.warn(`[DatabaseService] Skipping undecryptable shared pot ${pot.id} from user ${share.owner_user_id}:`, decryptError.message);
+                                            return;
+                                        }
                                         transformedPot.isShared = true;
                                         transformedPot.sharedOwnerId = share.owner_user_id;
                                         transformedPot.sharedAccessLevel = share.access_level;
