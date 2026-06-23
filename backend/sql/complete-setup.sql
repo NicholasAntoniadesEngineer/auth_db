@@ -155,54 +155,13 @@ CREATE POLICY paired_devices_delete_own ON paired_devices
 GRANT SELECT, INSERT, UPDATE, DELETE ON paired_devices TO authenticated;
 GRANT USAGE, SELECT ON SEQUENCE paired_devices_id_seq TO authenticated;
 
--- Device keys (temporary storage for device pairing requests)
--- Pairing codes are short-lived (5 minutes) and contain encrypted identity keys
-CREATE TABLE IF NOT EXISTS device_keys (
-    id BIGSERIAL PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    device_id TEXT NOT NULL,
-    device_name TEXT NOT NULL,
-    public_key TEXT NOT NULL,
-    encrypted_secret_key TEXT,
-    encryption_nonce TEXT,
-    pairing_code TEXT,
-    expires_at TIMESTAMPTZ,
-    is_primary BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-COMMENT ON COLUMN device_keys.encrypted_secret_key IS 'Secret key encrypted with pairing-code-derived key (XSalsa20-Poly1305)';
-COMMENT ON COLUMN device_keys.encryption_nonce IS 'Nonce used for secret key encryption';
-COMMENT ON COLUMN device_keys.pairing_code IS '6-digit code for device pairing (expires after 5 minutes)';
-
-DROP INDEX IF EXISTS idx_device_keys_user_id;
-DROP INDEX IF EXISTS idx_device_keys_pairing_code;
-CREATE INDEX idx_device_keys_user_id ON device_keys(user_id);
-CREATE INDEX idx_device_keys_pairing_code ON device_keys(pairing_code) WHERE pairing_code IS NOT NULL;
-
-ALTER TABLE device_keys ENABLE ROW LEVEL SECURITY;
-
--- SM-21: device_keys is correctly owner-scoped on every operation below
--- (auth.uid() = user_id), so no row is ever exposed beyond its owner.
--- NOTE: the 5-minute `expires_at` is NOT enforced here. The pairing flow that
--- writes these rows is being disabled separately; if it is ever re-enabled the
--- SELECT policy MUST also require `expires_at > now()` and a scheduled
--- `DELETE FROM device_keys WHERE expires_at < now()` must reap stale rows, so an
--- expired row holding the (weakly wrapped) identity secret cannot linger.
-CREATE POLICY device_keys_select_own ON device_keys
-    FOR SELECT USING (auth.uid() = user_id);
-
-CREATE POLICY device_keys_insert_own ON device_keys
-    FOR INSERT WITH CHECK (auth.uid() = user_id);
-
-CREATE POLICY device_keys_update_own ON device_keys
-    FOR UPDATE USING (auth.uid() = user_id);
-
-CREATE POLICY device_keys_delete_own ON device_keys
-    FOR DELETE USING (auth.uid() = user_id);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON device_keys TO authenticated;
-GRANT USAGE, SELECT ON SEQUENCE device_keys_id_seq TO authenticated;
+-- ADB-05/CR-4: the deprecated `device_keys` table (CREATE/index/policy/grant) has
+-- been removed — superseded by pairing_requests for the code-wrapped key handoff. It
+-- is not referenced by the encryption config (only `paired_devices` is) and its
+-- never-enforced 5-minute expiry left weakly-wrapped identity secrets able to linger.
+-- The `DROP TABLE IF EXISTS device_keys CASCADE` in the cleanup section above stays so
+-- re-running this script removes it from existing databases. (paired_devices is kept —
+-- still referenced by the encryption config.)
 
 -- Key rotation locks (prevents concurrent key rotations across devices/tabs)
 CREATE TABLE IF NOT EXISTS key_rotation_locks (
@@ -250,9 +209,13 @@ CREATE TABLE IF NOT EXISTS pairing_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_pairing_requests_user_id ON pairing_requests(user_id);
 ALTER TABLE pairing_requests ENABLE ROW LEVEL SECURITY;
+-- ADB-03/RLS-09: defense-in-depth — an EXPIRED wrapped bundle must not be selectable
+-- even before it is physically reaped. NOTE: the load-bearing half is an operator-set
+-- pg_cron reaper: `DELETE FROM pairing_requests WHERE expires_at < now();` (RLS only
+-- hides expired rows; it does not delete the at-rest ciphertext).
 DROP POLICY IF EXISTS pairing_requests_select_own ON pairing_requests;
 CREATE POLICY pairing_requests_select_own ON pairing_requests
-    FOR SELECT USING (auth.uid() = user_id);
+    FOR SELECT USING (auth.uid() = user_id AND expires_at > now());
 DROP POLICY IF EXISTS pairing_requests_insert_own ON pairing_requests;
 CREATE POLICY pairing_requests_insert_own ON pairing_requests
     FOR INSERT WITH CHECK (auth.uid() = user_id);

@@ -25,9 +25,13 @@ CREATE INDEX IF NOT EXISTS idx_pairing_requests_user_id ON pairing_requests(user
 
 ALTER TABLE pairing_requests ENABLE ROW LEVEL SECURITY;
 
+-- ADB-03/RLS-09: defense-in-depth — an EXPIRED wrapped bundle must not be selectable
+-- even before it is physically reaped. NOTE: the load-bearing half is an operator-set
+-- pg_cron reaper: `DELETE FROM pairing_requests WHERE expires_at < now();` (RLS only
+-- hides expired rows; it does not delete the at-rest ciphertext).
 DROP POLICY IF EXISTS pairing_requests_select_own ON pairing_requests;
 CREATE POLICY pairing_requests_select_own ON pairing_requests
-    FOR SELECT USING (auth.uid() = user_id);
+    FOR SELECT USING (auth.uid() = user_id AND expires_at > now());
 
 DROP POLICY IF EXISTS pairing_requests_insert_own ON pairing_requests;
 CREATE POLICY pairing_requests_insert_own ON pairing_requests
