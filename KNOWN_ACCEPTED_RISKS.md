@@ -66,17 +66,33 @@ the normal/dev test run. See `README.md` → "Before the pentest".)
   `encryption/services/passwordCryptoService.js` and re-mint backups minted under
   the 20-byte value. (SECURITY_AUDIT.md §5 item 1 / U-3.)
 
-### Argon2id backup-KDF migration (L-3) — planned, not yet implemented
-- The password-encrypted identity/recovery/session backups use **PBKDF2-SHA256
-  (600k) + AES-256-GCM** — acceptable today (OWASP-current), but the team intends
-  to migrate to memory-hard **Argon2id + a server-unknown pepper**. A concrete,
-  versioned migration plan (kdf_version field, Argon2id params, dual-read during
-  rollout, lazy re-encrypt, server-unknown pepper) is documented in the
-  `enforcePasswordStrength` doc block in
-  `encryption/services/passwordCryptoService.js` (pointer from
-  `keyBackupService.js`). This is a larger change deferred PAST the pentest;
-  PBKDF2 + the enforced 12-char strong-password policy is the interim control.
-  (SECURITY_AUDIT.md H-2 / L-3.)
+### Argon2id backup-KDF migration (L-3) — ADDRESSED (2026-06-24)
+- The password-encrypted identity/recovery/session backups now WRITE with
+  memory-hard **Argon2id** (vendored hash-wasm 4.12.0, MIT; OWASP params
+  m=64 MiB, t=3, p=1) + AES-256-GCM, replacing the non-memory-hard
+  **PBKDF2-SHA256(600k)** WRITE path. The change is in
+  `encryption/services/passwordCryptoService.js`:
+  - **Versioned envelope** — the stored `salt` field is self-describing: a bare
+    base64 salt = legacy `pbkdf2-sha256-600k`; a tagged JSON envelope
+    `{"kdf":"argon2id-m65536-t3-p1","salt":"…"}` = Argon2id. No DB schema change.
+  - **No-lockout READ** — the legacy PBKDF2 derive is preserved verbatim and is
+    selected for any untagged/`pbkdf2-*`-tagged backup, so OLD backups remain
+    readable forever.
+  - **Transparent upgrade** — on the next successful unlock, a legacy backup is
+    re-wrapped to Argon2id and persisted (`keyBackupService.js`
+    `_maybeUpgradeLegacyBackup` / `_maybeUpgradeLegacyRecoveryColumn`),
+    best-effort + non-fatal (a failed re-wrap never breaks the unlock).
+  - Proven by `encryption/tests/a18_argon2id_kdf.test.js` (Argon2id KAT,
+    round-trip, back-compat, fail-closed on both paths, kdf dispatch, upgrade)
+    and asserted by `prod_readiness_check.js` (WRITE path is Argon2id, params ≥
+    OWASP floor). Browser load: add
+    `<script src="../../shared/vendor/hash-wasm/argon2.umd.min.js"></script>`
+    (exposes `window.hashwasm`) on pages that wrap/unwrap a backup.
+- **Residual (NOT in scope of this change):** the *server-unknown pepper* from
+  the original plan is NOT implemented — Argon2id alone hardens the at-rest KDF
+  against offline brute force; binding a pepper (e.g. the 32-byte recovery key)
+  is a separate, larger follow-up. PBKDF2 READ support stays until telemetry
+  shows ~0 remaining legacy rows. (SECURITY_AUDIT.md H-2 / L-3.)
 
 ### Other §5 items (checked outside this JS guard)
 - **pg_cron reapers** (pairing-request expiry, trial-expiry downgrade) must be

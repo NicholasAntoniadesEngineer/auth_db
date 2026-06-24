@@ -140,10 +140,15 @@ does not "discover" them as surprises:
    `script-src 'unsafe-inline'`, while every messaging_app/money_tracker view
    removed it (H-5). See "Issues found" below — this one is arguably not just
    accepted, it looks stale.
-5. **Argon2id backup-KDF migration (L-3) — planned, not implemented.** Backups use
-   PBKDF2-SHA256(600k)+AES-256-GCM (OWASP-current) with a documented migration
-   plan to Argon2id + server-unknown pepper in the `enforcePasswordStrength` doc
-   block. Deferred past the pentest.
+5. **Argon2id backup-KDF migration (L-3) — ADDRESSED (2026-06-24).** Backups now
+   WRITE with memory-hard **Argon2id** (vendored hash-wasm 4.12.0; m=64 MiB, t=3,
+   p=1) + AES-256-GCM via a versioned, self-describing salt envelope; legacy
+   PBKDF2-SHA256(600k) backups stay readable forever and are transparently
+   re-wrapped to Argon2id on the next successful unlock (no-lockout). See
+   `passwordCryptoService.js`, `keyBackupService.js`, and the gate
+   `encryption/tests/a18_argon2id_kdf.test.js`. *Residual:* the server-unknown
+   **pepper** from the original plan is still NOT implemented (separate follow-up);
+   PBKDF2 READ support remains until ~0 legacy rows remain.
 6. **Sequential-only pairing / single-active assumptions.** Device pairing is a
    one-at-a-time code handoff (5-attempt limit, 5-minute expiry,
    `devicePairingService.js`); concurrent multi-device edge cases are not

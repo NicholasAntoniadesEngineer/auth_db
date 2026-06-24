@@ -46,6 +46,11 @@ if (typeof global.window === 'undefined') {
     global.window = global;
 }
 
+// WebCrypto + hash-wasm are needed for the Argon2id WRITE-path check below.
+if (typeof global.crypto === 'undefined') {
+    global.crypto = require('crypto').webcrypto;
+}
+
 const PasswordCryptoService = require('../services/passwordCryptoService.js');
 // devicePairingService.js publishes only via `window.DevicePairingService`
 // (no module.exports), so after requiring it we read it off the window stub.
@@ -106,18 +111,65 @@ check(
     `is ${DevicePairingService.PAIRING_CODE_BYTES}; must be >= ${PAIRING_CODE_BYTES_FLOOR}`
 );
 
-// --- summary ----------------------------------------------------------------
-process.stdout.write('\n----------------------------------------------------------------\n');
-if (failures.length === 0) {
-    process.stdout.write(`PROD-READINESS: PASS (${passes.length} checks). Safe to cut the pentest build.\n`);
-    process.exit(0);
-} else {
-    process.stdout.write(
-        `PROD-READINESS: FAIL (${failures.length} of ${passes.length + failures.length} checks failed).\n` +
-        'This is EXPECTED until the testing values are reverted for production:\n  - ' +
-        failures.join('\n  - ') + '\n\n' +
-        'NOTE: a non-zero exit here is the gate working as designed. Do NOT add this\n' +
-        'script to the default/dev test runner — it is run intentionally before release.\n'
+// --- L-3 / CRYPTO_DEEP_REVIEW HIGH: at-rest KDF is Argon2id on WRITE ---------
+// The backup-wrap WRITE path must mint Argon2id (memory-hard), NOT PBKDF2. Prove
+// it by actually wrapping a probe and inspecting the produced kdf descriptor +
+// the self-describing salt envelope. (Legacy PBKDF2 READ stays supported — that
+// is the no-lockout invariant verified by encryption/tests/a18_argon2id_kdf.)
+async function checkArgon2idWritePath() {
+    let env = null;
+    let err = null;
+    try {
+        // hash-wasm self-resolves via the service's node fallback; no injection.
+        env = await PasswordCryptoService.encryptToBase64(
+            new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
+            'CorrectHorseBattery9!' // passes the H-2 policy
+        );
+    } catch (e) { err = e; }
+
+    check(
+        !!env && typeof env.kdf === 'string' && /^argon2id-m\d+-t\d+-p\d+$/.test(env.kdf),
+        'backup WRITE path uses Argon2id (not PBKDF2)',
+        err ? `wrap threw: ${err.message}` : `kdf descriptor was "${env && env.kdf}" (expected argon2id-*)`
     );
-    process.exit(1);
+
+    // Param floor: memory >= 19 MiB (OWASP), iterations >= 2.
+    let mem = 0, iters = 0;
+    if (env && env.kdf) {
+        const m = /^argon2id-m(\d+)-t(\d+)-p(\d+)$/.exec(env.kdf);
+        if (m) { mem = parseInt(m[1], 10); iters = parseInt(m[2], 10); }
+    }
+    check(
+        mem >= 19 * 1024 && iters >= 2,
+        'Argon2id params meet the OWASP floor (m >= 19 MiB, t >= 2)',
+        `m=${mem} KiB, t=${iters}`
+    );
+
+    // The salt field must be the self-describing tagged envelope (so the kdf
+    // travels with the blob and the READ path can dispatch).
+    check(
+        !!env && typeof env.salt === 'string' && env.salt.charAt(0) === '{',
+        'Argon2id backups store the self-describing (tagged) salt envelope',
+        `salt field did not start with '{' (was "${env && env.salt && env.salt.slice(0, 12)}...")`
+    );
 }
+
+// --- summary ----------------------------------------------------------------
+(async () => {
+    await checkArgon2idWritePath();
+
+    process.stdout.write('\n----------------------------------------------------------------\n');
+    if (failures.length === 0) {
+        process.stdout.write(`PROD-READINESS: PASS (${passes.length} checks). Safe to cut the pentest build.\n`);
+        process.exit(0);
+    } else {
+        process.stdout.write(
+            `PROD-READINESS: FAIL (${failures.length} of ${passes.length + failures.length} checks failed).\n` +
+            'This is EXPECTED until the testing values are reverted for production:\n  - ' +
+            failures.join('\n  - ') + '\n\n' +
+            'NOTE: a non-zero exit here is the gate working as designed. Do NOT add this\n' +
+            'script to the default/dev test runner — it is run intentionally before release.\n'
+        );
+        process.exit(1);
+    }
+})();

@@ -233,10 +233,21 @@ All citations are to the canonical (non-`/lib/` mirror) files.
    `auth_db/encryption/tests/prod_readiness_check.js`). Confirm 160 bits behind
    PBKDF2-600k is genuinely non-brute-forceable for the *online* threat model, and
    confirm the prod build ships 32. (`KNOWN_ACCEPTED_RISKS.md` §B.)
-2. **PBKDF2 vs Argon2id:** 600k PBKDF2-SHA256 is OWASP-current but not memory-hard.
-   The Argon2id + server-unknown-pepper migration is documented but **not
-   implemented** (L-3). Assess the offline-brute-force risk on a stolen
-   `identity_key_backups` row given the enforced 12-char password policy.
+2. **PBKDF2 → Argon2id (L-3):** the at-rest backup KDF HIGH is now **ADDRESSED
+   (2026-06-24)**. The WRITE path mints memory-hard **Argon2id** (vendored
+   hash-wasm 4.12.0, MIT; m=64 MiB, t=3, p=1) + AES-256-GCM, carried in a
+   versioned, self-describing salt envelope; the legacy PBKDF2-SHA256(600k) READ
+   path is preserved verbatim (no-lockout) and legacy backups are transparently
+   re-wrapped to Argon2id on next unlock. See
+   `encryption/services/passwordCryptoService.js`,
+   `encryption/services/keyBackupService.js`, and the gate
+   `encryption/tests/a18_argon2id_kdf.test.js` (KAT + round-trip + back-compat +
+   fail-closed + upgrade); `prod_readiness_check.js` now asserts the WRITE path is
+   Argon2id at ≥ OWASP params. *Remaining (not in this change):* the
+   server-unknown **pepper** is still unimplemented — assess whether Argon2id
+   (memory-hard) alone is a sufficient offline-brute-force control for a stolen
+   `identity_key_backups` row given the enforced 12-char password policy, or
+   whether the pepper follow-up should be prioritised.
 3. **Pairing one-time-code entropy:** 80 bits behind PBKDF2-600k, with 5 attempts
    + 5-min expiry + single-use. Confirm the online brute-force is infeasible and
    that the wrapped bundle is reaped at rest (the **pairing_requests reaper is

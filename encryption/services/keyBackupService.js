@@ -73,18 +73,19 @@ const KeyBackupService = {
      * H-2 guard: refuse to derive a backup key from a weak password.
      *
      * This is the last line of defence so NO caller can persist a
-     * password-encrypted identity backup (PBKDF2-SHA256 + AES-256-GCM) under a
-     * password weak enough to be offline-brute-forced from a leaked/at-rest DB.
-     * The UI/auth layers also enforce this, but the policy lives in
+     * password-encrypted identity backup under a password weak enough to be
+     * offline-brute-forced from a leaked/at-rest DB. The UI/auth layers also
+     * enforce this, but the policy lives in
      * PasswordCryptoService.enforcePasswordStrength (single source of truth).
      *
-     * NOTE (L-3, planned — NOT yet implemented): the backup KDF here is PBKDF2.
-     * The concrete, versioned migration to memory-hard Argon2id + a
-     * server-unknown pepper (versioned kdf_version field, dual-read, lazy
-     * re-encrypt) is documented in full in
-     * PasswordCryptoService.enforcePasswordStrength's doc block ("MIGRATION PLAN
-     * (L-3)"). When implemented, this service's create/restore paths gain the
-     * kdf_version branch described there.
+     * KDF (L-3, IMPLEMENTED 2026-06-24): the backup WRITE path now derives the
+     * wrap key with memory-hard Argon2id (PasswordCryptoService.encryptToBase64);
+     * legacy PBKDF2-SHA256(600k) backups stay readable forever and are
+     * transparently upgraded to Argon2id on next unlock via
+     * _maybeUpgradeLegacyBackup / _maybeUpgradeLegacyRecoveryColumn below. The
+     * versioned envelope + no-lockout invariant are documented in the
+     * "KDF MIGRATION (L-3)" header of passwordCryptoService.js. (The
+     * server-unknown pepper from the original plan is a separate follow-up.)
      * @private
      * @param {string} password
      */
@@ -299,11 +300,98 @@ const KeyBackupService = {
             );
 
             console.log('[KeyBackupService] Successfully restored from password');
+
+            // L-3 transparent upgrade: if this backup was minted under the LEGACY
+            // PBKDF2 KDF, re-wrap it with Argon2id now (best-effort, non-fatal).
+            // A failed upgrade MUST NOT break the unlock — we already have the key.
+            // Fire-and-forget in production; `_lastUpgrade` is exposed so callers
+            // (and tests) can deterministically await completion when desired.
+            this._lastUpgrade = this._maybeUpgradeLegacyBackup(userId, backup, password, secretKey)
+                .catch((e) => console.warn('[KeyBackupService] Legacy backup upgrade skipped:', e && e.message));
+
             return secretKey;
         } catch (error) {
             console.error('[KeyBackupService] Password decryption failed:', error);
             throw new Error('Incorrect password');
         }
+    },
+
+    /**
+     * Transparently re-wrap a successfully-unlocked LEGACY (PBKDF2) backup with
+     * the current Argon2id KDF and persist it, so the fleet migrates off PBKDF2
+     * over time (L-3 / CRYPTO_DEEP_REVIEW HIGH).
+     *
+     * Strictly best-effort and NON-FATAL: it runs AFTER the caller already holds
+     * the recovered secret, so any failure here is logged and swallowed and can
+     * never cause a lockout. It only re-wraps the password- and (when present)
+     * recovery-/session-backup-key columns that are still PBKDF2; Argon2id rows
+     * are left untouched. Idempotent: once a row is Argon2id, this is a no-op.
+     *
+     * NOTE: the recovery column is re-wrapped under the SAME recovery key only
+     * when we can recover it from THIS unlock — which during a password unlock we
+     * cannot (we don't have the recovery key). So this path upgrades the
+     * password and session-backup-key columns; the recovery column is upgraded
+     * the next time restoreFromRecoveryKey succeeds. This keeps both unlock paths
+     * independently valid at all times (no-lockout).
+     *
+     * @private
+     * @param {string} userId
+     * @param {Object} backup - the stored backup row
+     * @param {string} password
+     * @param {Uint8Array} secretKey - the already-recovered identity secret
+     */
+    async _maybeUpgradeLegacyBackup(userId, backup, password, secretKey) {
+        if (!this._database) return;
+        if (typeof PasswordCryptoService.isLegacyBackup !== 'function') return;
+
+        // Only act if the password column is legacy PBKDF2.
+        if (!PasswordCryptoService.isLegacyBackup(backup.password_salt)) {
+            return; // already Argon2id — nothing to do
+        }
+
+        console.log('[KeyBackupService] Upgrading legacy PBKDF2 backup to Argon2id...');
+
+        const update = {};
+
+        // Re-wrap the identity secret under the password with Argon2id.
+        const pwEnc = await PasswordCryptoService.encryptToBase64(secretKey, password);
+        update.password_encrypted_data = pwEnc.encryptedData;
+        update.password_salt = pwEnc.salt;   // tagged argon2id envelope
+        update.password_iv = pwEnc.iv;
+
+        // Re-wrap the stable session backup key if present and still legacy.
+        if (backup.session_backup_key_encrypted
+            && PasswordCryptoService.isLegacyBackup(backup.session_backup_key_salt)) {
+            try {
+                const sessionBackupKey = await PasswordCryptoService.decryptFromBase64(
+                    backup.session_backup_key_encrypted,
+                    password,
+                    backup.session_backup_key_salt,
+                    backup.session_backup_key_iv
+                );
+                const skEnc = await PasswordCryptoService.encryptToBase64(sessionBackupKey, password);
+                update.session_backup_key_encrypted = skEnc.encryptedData;
+                update.session_backup_key_salt = skEnc.salt;
+                update.session_backup_key_iv = skEnc.iv;
+            } catch (e) {
+                // Leave the session-backup-key column legacy if it can't be
+                // re-wrapped; the password column upgrade still stands.
+                console.warn('[KeyBackupService] Session-backup-key upgrade skipped:', e && e.message);
+            }
+        }
+
+        const result = await this._database.queryUpdate(this._getBackupTableName(), null, {
+            ...update,
+            updated_at: new Date().toISOString()
+        }, {
+            user_id: userId
+        });
+
+        if (result && result.error) {
+            throw new Error(`queryUpdate failed: ${result.error.message}`);
+        }
+
+        console.log('[KeyBackupService] Legacy backup upgraded to Argon2id');
     },
 
     /**
@@ -349,11 +437,49 @@ const KeyBackupService = {
             );
 
             console.log('[KeyBackupService] Successfully restored from recovery key');
+
+            // L-3 transparent upgrade: re-wrap the LEGACY (PBKDF2) recovery column
+            // under the SAME recovery key with Argon2id. Best-effort, non-fatal.
+            this._lastUpgrade = this._maybeUpgradeLegacyRecoveryColumn(userId, backup, recoveryKeyB64, secretKey)
+                .catch((e) => console.warn('[KeyBackupService] Legacy recovery upgrade skipped:', e && e.message));
+
             return secretKey;
         } catch (error) {
             console.error('[KeyBackupService] Recovery key decryption failed:', error);
             throw new Error('Invalid recovery key');
         }
+    },
+
+    /**
+     * Transparently re-wrap a successfully-unlocked LEGACY (PBKDF2) RECOVERY
+     * column with Argon2id, under the SAME recovery key. Best-effort, non-fatal;
+     * runs after the secret is already recovered (no-lockout). Idempotent.
+     * @private
+     */
+    async _maybeUpgradeLegacyRecoveryColumn(userId, backup, recoveryKeyB64, secretKey) {
+        if (!this._database) return;
+        if (typeof PasswordCryptoService.isLegacyBackup !== 'function') return;
+        if (!backup.recovery_salt) return;
+        if (!PasswordCryptoService.isLegacyBackup(backup.recovery_salt)) return; // already Argon2id
+
+        console.log('[KeyBackupService] Upgrading legacy PBKDF2 recovery column to Argon2id...');
+
+        const recEnc = await PasswordCryptoService.encryptToBase64(secretKey, recoveryKeyB64);
+
+        const result = await this._database.queryUpdate(this._getBackupTableName(), null, {
+            recovery_encrypted_data: recEnc.encryptedData,
+            recovery_salt: recEnc.salt, // tagged argon2id envelope
+            recovery_iv: recEnc.iv,
+            updated_at: new Date().toISOString()
+        }, {
+            user_id: userId
+        });
+
+        if (result && result.error) {
+            throw new Error(`queryUpdate failed: ${result.error.message}`);
+        }
+
+        console.log('[KeyBackupService] Legacy recovery column upgraded to Argon2id');
     },
 
     /**
