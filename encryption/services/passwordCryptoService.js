@@ -184,14 +184,13 @@ const PasswordCryptoService = {
     // TESTING VALUE (20 bytes / 8 elements). MUST be 32 before production/pentest
     // — see prod-readiness guard.
     // ------------------------------------------------------------------------
-    // Recovery key shortened to 8 display groups (20 bytes / 160-bit) so it is
-    // easier to type during multi-device testing. formatRecoveryKey groups Base32
-    // by 4 chars, so 20 bytes -> 32 chars -> 8 groups ("8 elements"). For
-    // PRODUCTION set this back to 32 (full 256-bit) — a one-line revert that is
-    // GATED by encryption/tests/prod_readiness_check.js (run before release; it
-    // is EXPECTED to fail until this is 32 and is intentionally NOT part of the
-    // normal S0-S13 dev suite). See SECURITY_AUDIT.md §5 and KNOWN_ACCEPTED_RISKS.md.
-    RECOVERY_KEY_BYTES: 20,
+    // Recovery key at the FULL 32 bytes (256-bit) for production / external
+    // pentest. formatRecoveryKey groups Base32 by 4 chars (52 chars -> 13 groups).
+    // NOTE: during multi-device testing this was temporarily 20 bytes / 160-bit
+    // for easier typing; flipped to 32 before the pentest (2026-06-24). The flip
+    // is GATED by encryption/tests/prod_readiness_check.js, which now PASSES this
+    // check. See SECURITY_AUDIT.md §5 and KNOWN_ACCEPTED_RISKS.md.
+    RECOVERY_KEY_BYTES: 32,
 
     generateRecoveryKey() {
         const key = crypto.getRandomValues(new Uint8Array(this.RECOVERY_KEY_BYTES));
