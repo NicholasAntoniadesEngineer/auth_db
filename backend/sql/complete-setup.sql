@@ -554,7 +554,10 @@ BEGIN
         'opk_pub', CASE WHEN v_opk.id IS NOT NULL THEN v_opk.prekey_pub ELSE NULL END
     );
 EXCEPTION WHEN OTHERS THEN
-    RETURN jsonb_build_object('success', false, 'error', SQLERRM);
+    -- W6: do NOT leak raw SQLERRM to the (authenticated) caller. Keep the real
+    -- error in the server log; return a generic, non-revealing message.
+    RAISE LOG 'claim_one_time_prekey: %', SQLERRM;
+    RETURN jsonb_build_object('success', false, 'error', 'internal error');
 END;
 $$;
 
@@ -640,7 +643,9 @@ BEGIN
     END IF;
     RETURN jsonb_build_object('status', 'ok', 'user_id', v_user_id);
 EXCEPTION WHEN OTHERS THEN
-    RETURN jsonb_build_object('status', 'error', 'error', SQLERRM);
+    -- W6: do NOT leak raw SQLERRM to the caller. Log it server-side; return generic.
+    RAISE LOG 'resolve_user_id_by_email: %', SQLERRM;
+    RETURN jsonb_build_object('status', 'error', 'error', 'internal error');
 END;
 $$;
 
@@ -699,9 +704,63 @@ BEGIN
     END IF;
     RETURN jsonb_build_object('status', 'ok', 'email', v_email);
 EXCEPTION WHEN OTHERS THEN
-    RETURN jsonb_build_object('status', 'error', 'error', SQLERRM);
+    -- W6: do NOT leak raw SQLERRM to the caller. Log it server-side; return generic.
+    RAISE LOG 'resolve_email_by_user_id: %', SQLERRM;
+    RETURN jsonb_build_object('status', 'error', 'error', 'internal error');
 END;
 $$;
 
 REVOKE ALL ON FUNCTION resolve_email_by_user_id(UUID, UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION resolve_email_by_user_id(UUID, UUID) TO service_role;
+
+-- ============================================================================
+-- W6 — physical reaping of expired / time-boxed rows (pg_cron)
+-- ============================================================================
+-- RLS HIDES expired rows but never DELETEs them, so the at-rest ciphertext +
+-- social-graph metadata (who looked up / claimed what, and when) lingers in the
+-- table and in every backup. These guarded pg_cron jobs physically reap:
+--   * pairing_requests  — past their per-row expires_at (single-use, short TTL)
+--   * opk_claim_audit    — claim ledger rows older than 24h (only the recent
+--                          sliding window drives the rate-limit buckets)
+--   * user_lookup_audit  — lookup ledger rows older than 24h (same reasoning)
+-- Same guard pattern as expire-overdue-trials: schedule ONLY if pg_cron is
+-- present, else a RAISE NOTICE no-op. Idempotent: unschedule-if-exists, then
+-- schedule. NEVER a DROP TABLE — these only DELETE expired/aged rows.
+DO $$
+DECLARE
+    j RECORD;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        BEGIN
+            -- Idempotent: remove any prior incarnation of each job by name first.
+            FOR j IN
+                SELECT jobid FROM cron.job
+                WHERE jobname IN ('reap-pairing-requests',
+                                  'reap-opk-claim-audit',
+                                  'reap-user-lookup-audit')
+            LOOP
+                PERFORM cron.unschedule(j.jobid);
+            END LOOP;
+
+            PERFORM cron.schedule(
+                'reap-pairing-requests',
+                '*/15 * * * *',
+                $cron$DELETE FROM public.pairing_requests WHERE expires_at < now();$cron$
+            );
+            PERFORM cron.schedule(
+                'reap-opk-claim-audit',
+                '17 * * * *',
+                $cron$DELETE FROM public.opk_claim_audit WHERE claimed_at < now() - INTERVAL '24 hours';$cron$
+            );
+            PERFORM cron.schedule(
+                'reap-user-lookup-audit',
+                '23 * * * *',
+                $cron$DELETE FROM public.user_lookup_audit WHERE looked_at < now() - INTERVAL '24 hours';$cron$
+            );
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'pg_cron present but scheduling row-reaper jobs failed: %', SQLERRM;
+        END;
+    ELSE
+        RAISE NOTICE 'pg_cron not installed: expired-row reapers NOT scheduled. RLS still HIDES expired rows, but pairing_requests/opk_claim_audit/user_lookup_audit are not physically deleted. Enable pg_cron then re-run this file.';
+    END IF;
+END $$;

@@ -27,7 +27,7 @@ live config matches intent and prints a `PASS` / `FAIL` / `WARN` / `REVIEW` /
 | c | **Entitlement lockdown**: `authenticated` has `SELECT` but NOT `INSERT/UPDATE/DELETE` on `subscriptions` | `REVOKE INSERT, UPDATE ON subscriptions FROM authenticated` (payments_app complete-setup.sql ~520; combined ~820) |
 | c2–c4 | seq lockdown, service-only ledgers have no client grant, `data_shares` grant-flag columns are not client-writable | the `REVOKE`/`GRANT UPDATE(...)` column scoping (SEC-C1) |
 | d | Every `SECURITY DEFINER` function pins `search_path` (`pg_proc.proconfig`) + a positive control listing the expected DEFINER functions | every DEFINER body in the installers carries `SET search_path = public` |
-| e | `pg_cron` installed + `expire-overdue-trials` job scheduled; **recommended** `pairing_requests` reaper | `cron.schedule('expire-overdue-trials', '0 * * * *', ...)`; pairing reaper documented but **not auto-created** |
+| e | `pg_cron` installed + `expire-overdue-trials` job scheduled **and** the W6 expired-row reapers `reap-pairing-requests` / `reap-opk-claim-audit` / `reap-user-lookup-audit` scheduled | `cron.schedule('expire-overdue-trials', '0 * * * *', ...)` + the guarded reaper `DO $$` block (auth_db complete-setup.sql tail; combined fresh-install-complete.sql). **These reapers self-schedule ONLY if pg_cron is present — pg_cron MUST be enabled in the live project, else expired pairing_requests / opk_claim_audit / user_lookup_audit rows are HIDDEN by RLS but never physically deleted.** |
 | f | **MANUAL** Dashboard items: private bucket, no service-role key in client, anon key only, Auth config, prod-revert gate | cannot be seen from SQL |
 
 ## Reading the status values
