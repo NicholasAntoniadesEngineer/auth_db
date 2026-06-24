@@ -794,8 +794,19 @@ const AuthService = {
         try {
             if (window.KeyStorageService && typeof window.KeyStorageService.deleteDatabase === 'function') {
                 console.log('[AuthService] Wiping encryption IndexedDB (deleteDatabase)...');
-                await window.KeyStorageService.deleteDatabase();
-                console.log('[AuthService] Encryption IndexedDB wiped');
+                // F-1: never let a blocked/slow IndexedDB delete strand the redirect.
+                // A second open tab makes the delete fire `onblocked` (now resolved,
+                // not pending) but it can still be slow; mirror the best-effort
+                // server-sign-out pattern above and Promise.race the wipe against a
+                // 1.5 s timeout so the redirect ALWAYS proceeds. The browser keeps the
+                // delete queued, so the key DB is still wiped once other tabs close.
+                await Promise.race([
+                    window.KeyStorageService.deleteDatabase(),
+                    new Promise((resolve) =>
+                        setTimeout(() => resolve({ deleted: false, timedOut: true }), 1500)
+                    )
+                ]);
+                console.log('[AuthService] Encryption IndexedDB wipe issued');
             }
         } catch (wipeError) {
             console.warn('[AuthService] Failed to wipe encryption IndexedDB (continuing to redirect):', wipeError);

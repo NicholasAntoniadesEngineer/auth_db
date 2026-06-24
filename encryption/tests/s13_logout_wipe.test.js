@@ -165,6 +165,69 @@ function loadFreshAuthService() {
     });
 
     // ===================================================================
+    // F-1 regression gate: a deleteDatabase() that NEVER settles (the real
+    // hang — e.g. a second tab holds the key DB and onblocked left the promise
+    // pending) must NOT strand the redirect. signOut() now Promise.races the wipe
+    // against a ~1.5s timeout, so it must still resolve + redirect.
+    await H.gate('F-1: signOut does NOT hang when deleteDatabase never settles (blocked/pending)', async () => {
+        const win = installWindow({
+            // Simulate the hang: a promise that never resolves or rejects.
+            deleteDatabaseImpl: () => {
+                callOrder.push('deleteDatabase-hangs');
+                return new Promise(() => { /* never settles */ });
+            },
+        });
+        const AuthService = loadFreshAuthService();
+        AuthService.client = null;
+        AuthService.currentUser = { email: 'victim@example.test' };
+
+        const start = Date.now();
+        // If signOut still awaited the wipe unconditionally, this would hang forever
+        // and the surrounding test runner would time out. The Promise.race timeout
+        // (1500ms) must let it resolve.
+        const res = await AuthService.signOut();
+        const elapsed = Date.now() - start;
+
+        H.assert(res && res.success === true, 'signOut still returns success despite a never-settling deleteDatabase');
+        H.assert(callOrder.includes('deleteDatabase-hangs'), 'deleteDatabase was attempted (and hung)');
+        H.assert(callOrder.includes('redirect'), 'redirect STILL happened despite the hanging wipe (no logout hang)');
+        H.assertEqual(win.BudgetKeyService.clearCacheCalls, 1, 'budget cache still cleared despite the hanging wipe');
+        // Guard the timeout actually bounded the wait (well under a hung-forever run).
+        H.assert(elapsed < 3000, `signOut resolved within the race timeout window (elapsed=${elapsed}ms)`);
+    });
+
+    // ===================================================================
+    // F-1 unit gate: the deleteDatabase onblocked handler RESOLVES (no longer
+    // leaves the promise pending). Drive the real KeyStorageService.deleteDatabase
+    // with a stubbed indexedDB.deleteDatabase that fires onblocked.
+    await H.gate('F-1: KeyStorageService.deleteDatabase resolves on onblocked (does not hang)', async () => {
+        const KeyStorageService = require('../services/keyStorageService.js');
+        // Ensure deleteDatabase tries to close this tab's connection (exercises the
+        // close-first path) without a real open DB.
+        let closed = false;
+        KeyStorageService.db = { close() { closed = true; } };
+
+        const savedIDB = global.indexedDB;
+        global.indexedDB = {
+            deleteDatabase() {
+                const req = {};
+                // Fire onblocked on a later tick, like a real blocking second tab.
+                setTimeout(() => { if (req.onblocked) req.onblocked(); }, 1);
+                return req;
+            },
+        };
+        try {
+            // A real hang would make this await never resolve and time out the runner.
+            const result = await KeyStorageService.deleteDatabase();
+            H.assert(closed, 'deleteDatabase closed this tab\'s connection before deleting (not a blocker itself)');
+            H.assert(result && result.blocked === true, 'onblocked resolved with a {blocked:true} status (promise settled, no hang)');
+        } finally {
+            global.indexedDB = savedIDB;
+            KeyStorageService.db = null;
+        }
+    });
+
+    // ===================================================================
     await H.gate('post-wipe: real deleteDatabase removes the identity record (getIdentityKeys -> not found)', async () => {
         // This exercises the REAL KeyStorageService against fake-indexeddb to prove
         // the post-wipe state: no identity secret auto-loads after a logout wipe.

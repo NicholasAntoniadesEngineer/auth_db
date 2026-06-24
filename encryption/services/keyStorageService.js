@@ -1632,6 +1632,11 @@ const KeyStorageService = {
      * Delete the entire database
      */
     async deleteDatabase() {
+        // F-1: close THIS tab's connection FIRST so we are never the blocker. If
+        // every other tab is also closed, the delete proceeds immediately and
+        // onsuccess fires; if another tab still holds a connection, IndexedDB
+        // fires onblocked (NOT onsuccess) and the actual delete stays queued until
+        // those connections close.
         if (this.db) {
             this.db.close();
             this.db = null;
@@ -1645,7 +1650,7 @@ const KeyStorageService = {
             request.onsuccess = () => {
                 console.log('[KeyStorageService] Database deleted');
                 this.initialized = false;
-                resolve();
+                resolve({ deleted: true, blocked: false });
             };
 
             request.onerror = () => {
@@ -1653,8 +1658,16 @@ const KeyStorageService = {
                 reject(request.error);
             };
 
+            // F-1: a second connection (e.g. another tab) blocks the delete. We MUST
+            // resolve here rather than leave the promise pending forever — otherwise
+            // signOut() awaits a never-settling promise and logout hangs on
+            // "Signing out…" with no redirect. The browser keeps the delete QUEUED,
+            // so the key DB is still wiped once the other connections close (F-1
+            // residue is removed); the caller proceeds to the redirect now.
             request.onblocked = () => {
-                console.warn('[KeyStorageService] Database deletion blocked - close all connections');
+                console.warn('[KeyStorageService] Database deletion blocked by another connection - delete is queued and will complete when other tabs close; resolving so logout can proceed');
+                this.initialized = false;
+                resolve({ deleted: false, blocked: true });
             };
         });
     },
