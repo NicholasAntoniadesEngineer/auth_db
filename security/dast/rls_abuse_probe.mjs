@@ -412,6 +412,215 @@ async function rpcAbuse() {
     allowed ? 'service-role-only resolver callable by authenticated!' : `denied (status ${res.status})`);
 }
 
+// ============================================================================
+// 7. BUDGET-SHARE REVOCATION BYPASS.
+//    Revocation in this schema is NOT a 'revoked' status — data_shares.status only
+//    allows ('pending','accepted','rejected'), and the owner revokes by DELETEing
+//    the share (data_shares_delete_as_owner). The shared-read policies
+//    (user_months_select_shared / the budget_dek owner-only policy) re-evaluate the
+//    data_shares row on EVERY request, so once the share row is gone the recipient
+//    must immediately lose access. This probe runs AS THE EX-RECIPIENT (the attacker
+//    JWT) AFTER the operator has revoked (deleted) the share, and asserts the
+//    ex-recipient can no longer reach the owner's budget rows or the wrapped DEK.
+//
+//    OPERATOR STEP (do before running with REVOKED_SHARE=1): with the owner account,
+//    delete the share that was granted to the attacker
+//    (DELETE /rest/v1/data_shares?id=eq.<shareId> as the owner, or via the UI's
+//    "stop sharing"). Set VICTIM_USER_ID to the OWNER. If REVOKED_SHARE is not set,
+//    the probe records INFO (it cannot tell a never-shared owner from a revoked one).
+// ============================================================================
+const REVOKED_SHARE = process.env.REVOKED_SHARE === '1';
+async function revocationBypass() {
+  if (!REVOKED_SHARE) {
+    record('budget-share revocation bypass (ex-recipient reads owner rows)', 'INFO',
+      'set REVOKED_SHARE=1 AFTER the owner deletes the share to the attacker (VICTIM_USER_ID=owner) to test');
+    return;
+  }
+  // 7a. Ex-recipient tries to read the owner's budget months via the shared-read path.
+  {
+    const { status, rows } = await get('user_months', `user_id=eq.${VICTIM_USER_ID}&select=*`);
+    if (status === 404) { record('REVOKED user_months read', 'INFO', 'table not on this deploy (404)'); }
+    else {
+      const leaked = rowCount(rows);
+      record('REVOKED share: ex-recipient reads owner user_months',
+        leaked > 0 ? 'FAIL' : 'PASS',
+        leaked > 0 ? `STILL READS ${leaked} owner month(s) after revocation` : `blocked (status ${status}, 0 rows)`);
+    }
+  }
+  // 7b. Ex-recipient tries the owner's pots (also data_shares-scoped on most deploys).
+  {
+    const { status, rows } = await get('pots', `user_id=eq.${VICTIM_USER_ID}&select=*`);
+    if (status === 404) { record('REVOKED pots read', 'INFO', 'table not on this deploy (404)'); }
+    else {
+      const leaked = rowCount(rows);
+      record('REVOKED share: ex-recipient reads owner pots',
+        leaked > 0 ? 'FAIL' : 'PASS',
+        leaked > 0 ? `STILL READS ${leaked} owner pot(s) after revocation` : `blocked (status ${status}, 0 rows)`);
+    }
+  }
+  // 7c. The wrapped budget DEK is owner-only and NEVER share-readable; after
+  //     revocation it must stay unreachable (a leak here is catastrophic — it is the
+  //     key that unwraps every budget blob).
+  {
+    const { status, rows } = await get('budget_dek', `user_id=eq.${VICTIM_USER_ID}&select=*`);
+    if (status === 404) { record('REVOKED budget_dek read', 'INFO', 'table not on this deploy (404)'); }
+    else {
+      const leaked = rowCount(rows);
+      record('REVOKED share: ex-recipient reads owner budget_dek',
+        leaked > 0 ? 'FAIL' : 'PASS',
+        leaked > 0 ? `LEAKED owner wrapped DEK (${leaked} row) after revocation` : `blocked (status ${status}, 0 rows)`);
+    }
+  }
+  // 7d. The data_shares row itself must be gone for the ex-recipient (data_shares_select_involved
+  //     no longer matches once the owner deleted it). A surviving row means the
+  //     "revocation" did not actually remove the grant.
+  {
+    const { status, rows } = await get('data_shares',
+      `owner_user_id=eq.${VICTIM_USER_ID}&shared_with_user_id=eq.${ATTACKER_USER_ID || '00000000-0000-0000-0000-000000000000'}&select=id,status,share_all_data,can_edit`);
+    const survived = rowCount(rows);
+    record('REVOKED share: data_shares row gone for ex-recipient',
+      survived > 0 ? 'FAIL' : 'PASS',
+      survived > 0 ? `share row(s) STILL VISIBLE after revocation: ${JSON.stringify(rows)}` : `blocked/empty (status ${status})`);
+  }
+}
+
+// ============================================================================
+// 8. SCOPE-DOWNGRADE NOT ENFORCED.
+//    A share may be month-scoped (share_all_data=false, a specific year/month) or
+//    all-data (share_all_data=true). user_months_select_shared scopes a month-shared
+//    recipient to EXACTLY that (year,month). This probe runs AS THE RECIPIENT of a
+//    month-scoped share and asserts the recipient canNOT read the owner's OTHER
+//    months — i.e. the scope is enforced, not downgraded to all-data.
+//
+//    OPERATOR STEP: have the owner share EXACTLY ONE month to the attacker with
+//    share_all_data=false; the attacker accepts it. Set:
+//      VICTIM_USER_ID = owner, SHARED_YEAR + SHARED_MONTH = the granted month,
+//      OTHER_YEAR + OTHER_MONTH = a DIFFERENT owner month the attacker was NOT granted.
+// ============================================================================
+const SHARED_YEAR  = process.env.SHARED_YEAR  || null;
+const SHARED_MONTH = process.env.SHARED_MONTH || null;
+const OTHER_YEAR   = process.env.OTHER_YEAR   || null;
+const OTHER_MONTH  = process.env.OTHER_MONTH  || null;
+async function scopeDowngrade() {
+  if (!(SHARED_YEAR && SHARED_MONTH && OTHER_YEAR && OTHER_MONTH)) {
+    record('scope-downgrade: month-scoped recipient reads other months', 'INFO',
+      'set VICTIM_USER_ID=owner + SHARED_YEAR/SHARED_MONTH (granted) + OTHER_YEAR/OTHER_MONTH (not granted) to test');
+    return;
+  }
+  // 8a. The granted month SHOULD be readable (confirms the share is live; INFO).
+  {
+    const { status, rows } = await get('user_months',
+      `user_id=eq.${VICTIM_USER_ID}&year=eq.${SHARED_YEAR}&month=eq.${SHARED_MONTH}&select=id,year,month`);
+    record('scope-downgrade: granted month readable (sanity)', 'INFO',
+      `status ${status}, ${rowCount(rows)} row(s) — expected READABLE for a live month-scoped share`);
+  }
+  // 8b. A DIFFERENT, un-granted month MUST NOT be readable. If it is, the per-month
+  //     scope has been (effectively) downgraded to all-data — FAIL.
+  {
+    const { status, rows } = await get('user_months',
+      `user_id=eq.${VICTIM_USER_ID}&year=eq.${OTHER_YEAR}&month=eq.${OTHER_MONTH}&select=id,year,month`);
+    const leaked = rowCount(rows);
+    record('scope-downgrade: recipient reads UN-granted month',
+      leaked > 0 ? 'FAIL' : 'PASS',
+      leaked > 0 ? `month-scope ESCAPED: read ${leaked} row(s) of an un-shared month` : `blocked (status ${status}, 0 rows)`);
+  }
+  // 8c. Recipient must not be able to widen the share to all-data via direct PATCH
+  //     (recipient column GRANT is status-only; share_all_data is not writable by them).
+  if (VICTIM_SHARE_ID) {
+    const { status, rows } = await patch('data_shares', `id=eq.${VICTIM_SHARE_ID}`, { share_all_data: true });
+    const widened = Array.isArray(rows) && rows.some(r => r && r.share_all_data === true);
+    record('scope-downgrade: recipient widens share_all_data via PATCH',
+      widened ? 'FAIL' : 'PASS',
+      widened ? 'recipient flipped share_all_data=true (scope widened)!' : detailFor(status, rows));
+  }
+}
+
+// ============================================================================
+// 9. CROSS-USER READ of notifications / friends (social graph + sender/from leak).
+//    notifications_select_own  USING(auth.uid()=user_id)        -> own feed only.
+//    friends_select_involved   USING(uid=user_id OR uid=friend_user_id) -> a third
+//      party (neither side of an edge) must read 0 of the victim's friendship rows.
+//    The existing crossUserSelects() probes notifications by user_id; this adds the
+//    from_user_id leak vector (could an attacker enumerate who notified the victim?)
+//    and the friends social graph, which the original probe did not cover.
+// ============================================================================
+async function crossUserSocialReads() {
+  // 9a. Victim's notifications addressed FROM the attacker — still scoped to the
+  //     recipient (user_id), so the attacker (the sender) must NOT see the victim's
+  //     copy of the row. FAIL = the from_user_id filter exposes recipient rows.
+  if (ATTACKER_USER_ID) {
+    const { status, rows } = await get('notifications',
+      `user_id=eq.${VICTIM_USER_ID}&from_user_id=eq.${ATTACKER_USER_ID}&select=*`);
+    if (status === 404) { record('SELECT notifications (from_user_id leak)', 'INFO', 'table not on this deploy (404)'); }
+    else {
+      const leaked = rowCount(rows);
+      record('SELECT victim notifications via from_user_id (sender cannot read recipient feed)',
+        leaked > 0 ? 'FAIL' : 'PASS',
+        leaked > 0 ? `LEAKED ${leaked} of victim's notification rows` : `blocked (status ${status}, 0 rows)`);
+    }
+  }
+  // 9b. Victim's friendship rows — a non-involved third party (attacker) reads 0.
+  for (const [col, what] of [
+    ['user_id',        'victim-initiated friendships'],
+    ['friend_user_id', 'friendships pointing AT victim'],
+  ]) {
+    const { status, rows } = await get('friends', `${col}=eq.${VICTIM_USER_ID}&select=*`);
+    if (status === 404) { record(`SELECT friends (${what})`, 'INFO', 'table not on this deploy (404)'); continue; }
+    const leaked = rowCount(rows);
+    record(`SELECT victim friends by ${col} (${what})`,
+      leaked > 0 ? 'FAIL' : 'PASS',
+      leaked > 0 ? `LEAKED ${leaked} victim friendship row(s) — social graph exposure` : `blocked (status ${status}, 0 rows)`);
+  }
+}
+
+// ============================================================================
+// 10. resolve_email_by_user_id direct client call (service_role-ONLY).
+//     The L-1 reverse resolver (userId -> email) is, like resolve_user_id_by_email,
+//     REVOKEd from PUBLIC and GRANTed only to service_role; only the user-lookup edge
+//     function (with its service key) may call it. A direct call from an
+//     `authenticated` JWT must be DENIED (PostgREST 401/403 / "permission denied for
+//     function"). FAIL = it returns an {status:'ok'|'not_found'|'rate_limited'} body,
+//     i.e. it actually executed -> the email-existence oracle is directly reachable.
+// ============================================================================
+async function resolveEmailByUserIdDirect() {
+  const res = await rpc('resolve_email_by_user_id', {
+    p_caller_id: ATTACKER_USER_ID || VICTIM_USER_ID, p_user_id: VICTIM_USER_ID
+  });
+  const executed = res.body &&
+    (res.body.status === 'ok' || res.body.status === 'not_found' || res.body.status === 'rate_limited');
+  record('RPC resolve_email_by_user_id direct client call',
+    executed ? 'FAIL' : 'PASS',
+    executed ? 'service-role-only reverse resolver executed for an authenticated caller!'
+             : `denied (status ${res.status}${res.body && res.body.message ? ', ' + res.body.message : ''})`);
+}
+
+// ============================================================================
+// 11. WRITE pairing_requests FOR ANOTHER USER.
+//     pairing_requests_insert_own  WITH CHECK (auth.uid()=user_id). An attacker must
+//     not be able to plant a wrapped pairing bundle under the VICTIM's user_id (that
+//     would let the attacker seed/poison the victim's device-pairing channel). We
+//     supply all NOT NULL columns with valid dummy ciphertext + a future expires_at,
+//     so the ONLY thing that can reject the row is the RLS WITH CHECK — not a column
+//     constraint (which would mask a real hole). FAIL = a row is written with the
+//     victim's user_id.
+// ============================================================================
+async function writePairingForVictim() {
+  const future = new Date(Date.now() + 3600_000).toISOString();
+  const ins = await insert('pairing_requests', {
+    user_id: VICTIM_USER_ID,
+    encrypted_data: 'cHJvYmU=',   // base64 "probe" — satisfies NOT NULL; opaque
+    salt: 'cHJvYmU=',
+    iv: 'cHJvYmU=',
+    expires_at: future,
+  });
+  const planted = Array.isArray(ins.rows) && ins.rows.length > 0 && ins.rows[0] &&
+    (ins.rows[0].user_id === VICTIM_USER_ID);
+  record('INSERT pairing_requests for VICTIM (forge pairing bundle)',
+    (!planted) ? 'PASS' : 'FAIL',
+    planted ? `planted a pairing bundle under the victim's user_id (id ${ins.rows[0].id})!`
+            : detailFor(ins.status, ins.rows));
+}
+
 // ---- helpers for write-blocked interpretation -----------------------------
 // A cross-user write is "blocked" when the server did NOT write the targeted row:
 //   - 401/403 hard deny, OR
@@ -444,6 +653,16 @@ async function main() {
   await pendingWindowEscalation();
   console.log('');
   await rpcAbuse();
+  console.log('');
+  await revocationBypass();
+  console.log('');
+  await scopeDowngrade();
+  console.log('');
+  await crossUserSocialReads();
+  console.log('');
+  await resolveEmailByUserIdDirect();
+  console.log('');
+  await writePairingForVictim();
 
   const fails = results.filter(r => r.status === 'FAIL');
   console.log(`\n=== summary: ${results.filter(r=>r.status==='PASS').length} PASS, ` +

@@ -22,11 +22,15 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.7'
  *   1. Collect the user's conversation ids.
  *   2. Remove Storage attachment objects from the `message-attachments` bucket
  *      (Storage objects are NOT covered by the FK cascade).
- *   3. admin.deleteUser(user.id) — cascades every ON DELETE CASCADE FK row in
- *      the public schema (friends, blocked_users, identity_keys,
- *      public_key_history, paired_devices, device_keys, key_rotation_locks,
- *      conversations, messages, message_attachments, conversation_session_keys,
- *      identity_key_backups).
+ *   3. admin.deleteUser(user.id) — cascades EVERY `ON DELETE CASCADE` FK row in
+ *      the public schema bound to auth.users(id). This spans the E2E key tables
+ *      (identity_keys, public_key_history, prekeys, one_time_prekeys,
+ *      identity_key_backups, conversation_session_keys, pairing_requests), the
+ *      messaging tables (conversations, messages, message_attachments, friends,
+ *      blocked_users), the rate-limit ledgers (opk_claim_audit, user_lookup_audit),
+ *      and the budget/billing tables. The FK constraints in the setup SQL are the
+ *      SOURCE OF TRUTH — this list is representative, not exhaustive, to avoid the
+ *      comment drift that L7-1 flagged.
  *   4. Return 200 with a summary.
  */
 
