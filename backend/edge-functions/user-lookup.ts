@@ -104,7 +104,10 @@ serve(async (req) => {
         return await handleFindByEmail(supabaseAdmin, email, authData.user.id)
 
       case 'getEmailById':
-        return await handleGetEmailById(supabaseAdmin, userId)
+        // L-1: pass the JWT-verified caller id so the resolver can rate-limit
+        // per-caller (shared budget with findByEmail) and so the response can be
+        // made a uniform 200 { email | null } instead of a user-id existence oracle.
+        return await handleGetEmailById(supabaseAdmin, userId, authData.user.id)
 
       default:
         return new Response(
@@ -209,9 +212,22 @@ async function handleFindByEmail(supabaseAdmin: any, email: string, callerId: st
 }
 
 /**
- * Get email by user ID
+ * Get email by user ID (L-1 hardened — mirrors W3-3's findByEmail).
+ *
+ * Old behaviour was an unthrottled reverse-lookup that returned 404-vs-200 keyed
+ * on the user id (a user-id existence oracle) via a raw auth.admin.getUserById().
+ * This version:
+ *   - resolves via the SECURITY DEFINER `resolve_email_by_user_id` RPC, a single
+ *     INDEXED lookup against auth.users by primary key;
+ *   - rate-limits per caller inside that RPC (the caller id from the verified JWT
+ *     is passed in; the RPC counts hits AND misses; SHARED budget with
+ *     resolve_user_id_by_email so a caller can't dodge the cap by alternating);
+ *   - returns a UNIFORM 200 shape `{ email: <addr|null> }` for both found and
+ *     not-found, so the response status no longer doubles as an existence oracle.
+ *     A genuine caller still gets the email it needs; the client treats a null
+ *     email as a clean "not found".
  */
-async function handleGetEmailById(supabaseAdmin: any, userId: string) {
+async function handleGetEmailById(supabaseAdmin: any, userId: string, callerId: string) {
   if (!userId) {
     return new Response(
       JSON.stringify({ error: 'User ID is required' }),
@@ -222,22 +238,14 @@ async function handleGetEmailById(supabaseAdmin: any, userId: string) {
     )
   }
 
-  // Look up user by ID using admin client
-  const { data, error } = await supabaseAdmin.auth.admin.getUserById(userId)
+  // Targeted, rate-limited resolution. The RPC is granted to service_role only.
+  const { data, error } = await supabaseAdmin.rpc('resolve_email_by_user_id', {
+    p_caller_id: callerId,
+    p_user_id: userId,
+  })
 
   if (error) {
-    console.error('Error getting user by ID:', error)
-
-    if (error.message?.includes('not found')) {
-      return new Response(
-        JSON.stringify({ error: 'User not found' }),
-        {
-          status: 404,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        }
-      )
-    }
-
+    console.error('Error resolving email by user id:', error)
     return new Response(
       JSON.stringify({ error: 'Failed to get user' }),
       {
@@ -247,19 +255,37 @@ async function handleGetEmailById(supabaseAdmin: any, userId: string) {
     )
   }
 
-  if (!data.user || !data.user.email) {
+  // Rate limit exceeded -> 429 (do NOT leak existence either way).
+  if (data?.status === 'rate_limited') {
     return new Response(
-      JSON.stringify({ error: 'User email not found' }),
+      JSON.stringify({ error: 'Too many lookups, please try again later' }),
       {
-        status: 404,
+        status: 429,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+          ...(data.retry_after_seconds ? { 'Retry-After': String(data.retry_after_seconds) } : {}),
+        }
+      }
+    )
+  }
+
+  if (data?.status === 'error') {
+    console.error('resolve_email_by_user_id error:', data.error)
+    return new Response(
+      JSON.stringify({ error: 'Failed to get user' }),
+      {
+        status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       }
     )
   }
 
-  // Return user email
+  // Uniform 200 for both found and not-found: { email: <addr|null> }. This blunts
+  // the 200-vs-404 existence oracle; the legitimate caller reads email when set.
+  const resolvedEmail = data?.status === 'ok' ? data.email : null
   return new Response(
-    JSON.stringify({ email: data.user.email }),
+    JSON.stringify({ email: resolvedEmail }),
     {
       status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }

@@ -649,3 +649,59 @@ $$;
 -- re-open a direct, un-vetted oracle bypassing the edge function's auth).
 REVOKE ALL ON FUNCTION resolve_user_id_by_email(UUID, TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION resolve_user_id_by_email(UUID, TEXT) TO service_role;
+
+-- resolve_email_by_user_id(p_caller_id, p_user_id): the L-1 companion to the
+-- resolver above — the REVERSE userId -> email lookup used by getEmailById. Same
+-- pattern, opposite direction; shares the SAME user_lookup_audit budget so a
+-- caller cannot dodge the cap by alternating directions. Brings getEmailById to
+-- parity with findByEmail (W3-3): per-caller rate limit (hits AND misses counted)
+-- + the edge function returns a uniform 200 {email|null}, killing the 404-vs-200
+-- user-id existence oracle. SECURITY DEFINER; granted ONLY to service_role.
+-- Returns JSONB: {status:'ok',email} | {status:'not_found'} | {status:'rate_limited'}.
+CREATE OR REPLACE FUNCTION resolve_email_by_user_id(p_caller_id UUID, p_user_id UUID)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    LOOKUP_WINDOW   CONSTANT INTERVAL := INTERVAL '1 hour';
+    LOOKUP_MAX      CONSTANT INTEGER  := 30;   -- shared budget with resolve_user_id_by_email
+    v_count INTEGER;
+    v_email TEXT;
+BEGIN
+    IF p_caller_id IS NULL THEN
+        RETURN jsonb_build_object('status', 'error', 'error', 'caller required');
+    END IF;
+    IF p_user_id IS NULL THEN
+        RETURN jsonb_build_object('status', 'error', 'error', 'user id required');
+    END IF;
+
+    -- Per-caller rate limit (count BOTH hits and misses so the oracle is throttled).
+    SELECT count(*) INTO v_count
+    FROM user_lookup_audit
+    WHERE caller_id = p_caller_id
+      AND looked_at > NOW() - LOOKUP_WINDOW;
+    IF v_count >= LOOKUP_MAX THEN
+        RETURN jsonb_build_object('status', 'rate_limited',
+                                  'retry_after_seconds', EXTRACT(EPOCH FROM LOOKUP_WINDOW)::int);
+    END IF;
+    INSERT INTO user_lookup_audit (caller_id) VALUES (p_caller_id);
+
+    -- Targeted resolution against the indexed auth.users primary key.
+    SELECT email INTO v_email
+    FROM auth.users
+    WHERE id = p_user_id
+    LIMIT 1;
+
+    IF v_email IS NULL THEN
+        RETURN jsonb_build_object('status', 'not_found');
+    END IF;
+    RETURN jsonb_build_object('status', 'ok', 'email', v_email);
+EXCEPTION WHEN OTHERS THEN
+    RETURN jsonb_build_object('status', 'error', 'error', SQLERRM);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION resolve_email_by_user_id(UUID, UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION resolve_email_by_user_id(UUID, UUID) TO service_role;

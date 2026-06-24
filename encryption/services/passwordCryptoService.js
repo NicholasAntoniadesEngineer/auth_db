@@ -180,10 +180,17 @@ const PasswordCryptoService = {
      * Generate a random recovery key (256-bit)
      * @returns {string} Base64-encoded recovery key
      */
-    // TESTING: recovery key shortened to 8 display groups (20 bytes / 160-bit) so it
-    // is easier to type during multi-device testing. formatRecoveryKey groups Base32
-    // by 4 chars, so 20 bytes -> 32 chars -> 8 groups ("8 elements"). For PRODUCTION
-    // set this back to 32 (full 256-bit). One-line revert.
+    // ------------------------------------------------------------------------
+    // TESTING VALUE (20 bytes / 8 elements). MUST be 32 before production/pentest
+    // — see prod-readiness guard.
+    // ------------------------------------------------------------------------
+    // Recovery key shortened to 8 display groups (20 bytes / 160-bit) so it is
+    // easier to type during multi-device testing. formatRecoveryKey groups Base32
+    // by 4 chars, so 20 bytes -> 32 chars -> 8 groups ("8 elements"). For
+    // PRODUCTION set this back to 32 (full 256-bit) — a one-line revert that is
+    // GATED by encryption/tests/prod_readiness_check.js (run before release; it
+    // is EXPECTED to fail until this is 32 and is intentionally NOT part of the
+    // normal S0-S13 dev suite). See SECURITY_AUDIT.md §5 and KNOWN_ACCEPTED_RISKS.md.
     RECOVERY_KEY_BYTES: 20,
 
     generateRecoveryKey() {
@@ -343,19 +350,69 @@ const PasswordCryptoService = {
      * (signup) and whenever the account password changes (reset). Throws if the
      * password is too weak so the caller never derives a backup key from it.
      *
-     * SECURITY_AUDIT.md finding H-2 — deeper hardening still TODO (documented,
-     * not yet implemented; tracked separately so the wiring/length fix can land
-     * now):
-     *   - TODO(H-2): migrate the backup KDF from PBKDF2-SHA256 (encryptToBase64
-     *     in this file) to memory-hard Argon2id, which dramatically raises the
-     *     cost of the offline brute force this finding describes.
-     *   - TODO(H-2): mix in a server-unknown KDF pepper so an at-rest/leaked DB
-     *     read alone cannot mount the offline attack without the (separately
-     *     held) pepper.
-     *   - TODO(H-2): prefer the high-entropy recovery key as the PRIMARY backup
-     *     escrow and treat the password-encrypted backup as a convenience copy,
-     *     so backup security no longer hinges on human password entropy. (Gated
-     *     on RECOVERY_KEY_BYTES being restored to 32 — a separate decision.)
+     * SECURITY_AUDIT.md finding H-2 / L-3 — deeper hardening still TODO. The
+     * concrete MIGRATION PLAN below is intentionally NOT implemented here:
+     * swapping the KDF is a larger, data-format-versioned change (it has to
+     * dual-read existing PBKDF2 backups during rollout). This scaffold exists so
+     * the plan is actionable and not forgotten. See deriveKeyFromPassword /
+     * encryptToBase64 in this file (the KDF + seal sites the plan touches) and
+     * KeyBackupService.createIdentityBackup (the consumer).
+     *
+     * ============================ MIGRATION PLAN (L-3) ======================
+     * Goal: move the password-encrypted identity/recovery/session backups from
+     * PBKDF2-SHA256(600k) to memory-hard Argon2id + a server-unknown pepper,
+     * WITHOUT locking out users whose backups were minted under PBKDF2.
+     *
+     * 1. VERSIONED KDF FIELD (data format).
+     *    - Add a `kdf_version` (SMALLINT) column to the backup tables
+     *      (identity_key_backups + conversation_session_keys) and a matching
+     *      `kdfVersion` field on every persisted blob written by KeyBackupService.
+     *      kdf_version = 1  => legacy PBKDF2-SHA256(600k) + AES-256-GCM (today).
+     *      kdf_version = 2  => Argon2id + AES-256-GCM (target).
+     *    - Persist the Argon2id parameters per-row (memKiB, iterations/timeCost,
+     *      parallelism, saltLen) alongside the salt so a future parameter bump is
+     *      itself forward/backward compatible. NEVER infer params from version
+     *      alone — store them.
+     *
+     * 2. ARGON2id PARAMS (starting point; tune to ~250-500ms on a low-end
+     *    target device, then pin):
+     *      - memory:      64 MiB  (m = 65536 KiB)  — the memory-hardness is the
+     *                     point; do not drop below 19 MiB (OWASP floor).
+     *      - iterations:  3 (timeCost)
+     *      - parallelism: 1 (lanes) — WASM single-thread friendly.
+     *      - hashLen:     32 bytes (AES-256 key) ; saltLen 16 bytes (random).
+     *      Library: a vendored, SRI-pinned argon2 WASM build loaded the same way
+     *      as TweetNaCl (CryptoLibraryLoader), with a startup KAT self-test
+     *      (fail-closed) before use — mirror L-6's nacl hardening.
+     *
+     * 3. SERVER-UNKNOWN PEPPER.
+     *    - Mix a high-entropy pepper that the server never stores into the KDF
+     *      input (e.g. HKDF(password, salt) XOR pepper, or feed pepper as Argon2
+     *      `secret`/associated data). Candidate pepper sources, in order:
+     *        (a) the user's high-entropy recovery key (preferred once
+     *            RECOVERY_KEY_BYTES is restored to 32 — see prod-readiness guard),
+     *        (b) a device-held secret synced out-of-band via pairing.
+     *      The pepper must be reconstructable on legitimate restore but absent
+     *      from any single at-rest/leaked DB read, so a stolen DB alone cannot
+     *      mount the offline brute force H-2 describes.
+     *
+     * 4. DUAL-READ DURING MIGRATION (no flag-day).
+     *    - WRITE path: new/rotated backups are written at kdf_version = 2.
+     *    - READ path (restoreFromPassword / restoreFromRecoveryKey /
+     *      restoreSessionBackupKey): branch on the stored kdf_version —
+     *        v1 -> deriveKeyFromPassword (existing PBKDF2) ;
+     *        v2 -> deriveKeyFromPasswordArgon2id (new).
+     *    - LAZY RE-ENCRYPT: on a successful v1 restore, transparently re-seal the
+     *      recovered secret at v2 and upsert (opportunistic upgrade on next login;
+     *      reuse the updatePassword re-mint path). No mass re-encryption required.
+     *    - Keep v1 read support until telemetry shows ~0 remaining v1 rows, then
+     *      schedule removal behind a deprecation window.
+     *
+     * 5. REGRESSION GATES (add to the S-suite when implemented):
+     *    - a v1 blob still decrypts (back-compat) ; a v2 round-trips ; a v1 blob
+     *      is upgraded to v2 after one successful restore ; a v2 blob does NOT
+     *      decrypt without the pepper.
+     * =======================================================================
      *
      * @param {string} password - Password to validate
      * @throws {Error} If password is too weak

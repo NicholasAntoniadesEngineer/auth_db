@@ -36,6 +36,21 @@ git submodule add https://github.com/NicholasAntoniadesEngineer/auth_db lib/auth
 3. **payments** — subscription tables + Stripe edge functions
 4. **budget** — money_tracker's budget tables
 
+## Before the pentest — prod-readiness gate
+
+The dev build ships a few deliberate TESTING weakenings (SECURITY_AUDIT.md §5).
+Run the standalone prod-readiness guard before cutting the pentest build:
+
+```bash
+node encryption/tests/prod_readiness_check.js   # must exit 0 to ship
+```
+
+It is **separate from the normal S0-S13 crypto suite** (do not add it to the dev
+runner) and is **EXPECTED to fail today** — that failure is the gate. The action
+it gates is flipping `RECOVERY_KEY_BYTES` from its 20-byte testing value to `32`
+in `encryption/services/passwordCryptoService.js` (then re-mint affected backups).
+See `KNOWN_ACCEPTED_RISKS.md` for the full list of tracked prod-revert items.
+
 ## Notes / to refine
 - `authGuard` currently calls the payments `SubscriptionChecker` for the business
   gate (degrades gracefully if absent). That foundation→payments coupling will be

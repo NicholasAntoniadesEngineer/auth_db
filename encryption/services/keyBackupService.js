@@ -77,6 +77,14 @@ const KeyBackupService = {
      * password weak enough to be offline-brute-forced from a leaked/at-rest DB.
      * The UI/auth layers also enforce this, but the policy lives in
      * PasswordCryptoService.enforcePasswordStrength (single source of truth).
+     *
+     * NOTE (L-3, planned — NOT yet implemented): the backup KDF here is PBKDF2.
+     * The concrete, versioned migration to memory-hard Argon2id + a
+     * server-unknown pepper (versioned kdf_version field, dual-read, lazy
+     * re-encrypt) is documented in full in
+     * PasswordCryptoService.enforcePasswordStrength's doc block ("MIGRATION PLAN
+     * (L-3)"). When implemented, this service's create/restore paths gain the
+     * kdf_version branch described there.
      * @private
      * @param {string} password
      */
