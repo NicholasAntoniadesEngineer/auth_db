@@ -1,0 +1,36 @@
+name: crypto-gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  crypto:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: E2E crypto suite (S0-S13 + a15-a18) + prod-readiness
+        working-directory: encryption/tests
+        run: |
+          set -e
+          for t in \
+            s0_primitives s1_double_ratchet s2_x3dh s4_persistence s5_s6_e2e \
+            s7_pairing s8_fail_closed s9_hardening s10_password_policy \
+            s11_responder_ik_binding s12_attachment_key_invariance s13_logout_wipe \
+            a15_downgrade_resistance a16_replay_reorder a17_tofu_pin_change a18_argon2id_kdf ; do
+            echo "== $t =="
+            node "$t.test.js"
+          done
+          echo "== prod_readiness_check =="
+          node prod_readiness_check.js
